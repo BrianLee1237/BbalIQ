@@ -276,6 +276,23 @@ def pick_corners_interactive(video_path: str) -> "np.ndarray":
     return compute_homography(clicked[: len(names)], names)
 
 
+def default_full_frame_homography(width: int, height: int) -> "np.ndarray":
+    """Automatic homography with no clicking required: assumes the video
+    frame is a straight-on, full-court view and maps its four corners
+    directly to the court's four corners.
+
+    This is a real accuracy trade-off, not a substitute for calibration --
+    it's wrong for angled, sideline, partial-court, or zoomed-in footage,
+    which is most real game footage. Court positions and everything
+    downstream of them (possession, decisions) will be skewed accordingly.
+    Use pick_corners_interactive() instead whenever accuracy matters and a
+    display is available to click landmarks on.
+    """
+    image_points = [(0, height), (width, height), (0, 0), (width, 0)]
+    landmark_names = ["baseline_left", "baseline_right", "halfcourt_left", "halfcourt_right"]
+    return compute_homography(image_points, landmark_names)
+
+
 def project_point(homography: "np.ndarray", point) -> tuple:
     if np is None:
         raise RuntimeError("numpy is required to project points.")
@@ -867,9 +884,30 @@ def main():
     parser.add_argument("--ball-model", default=BALL_MODEL_PATH, help="Path to ball detector weights")
     parser.add_argument("--player-model", default=PLAYER_MODEL_PATH, help="Path to player detector weights")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit frames processed (for quick tests)")
+    parser.add_argument(
+        "--interactive", action="store_true",
+        help="Click 4+ court landmarks on a paused frame for an accurate homography "
+             "(needs a display). Default is an automatic full-frame homography, which "
+             "is faster to run but only accurate for a straight-on full-court view.",
+    )
     args = parser.parse_args()
 
-    homography = pick_corners_interactive(args.video)
+    if args.interactive:
+        homography = pick_corners_interactive(args.video)
+    else:
+        capture = cv2.VideoCapture(args.video)
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        capture.release()
+        if not width or not height:
+            raise RuntimeError(f"Could not read dimensions from {args.video}.")
+        print(
+            "Using an automatic full-frame homography (no landmark clicking). "
+            "This assumes a straight-on full-court view -- pass --interactive "
+            "for accurate calibration on angled or partial-court footage."
+        )
+        homography = default_full_frame_homography(width, height)
+
     data = analyze_video(
         args.video, homography,
         ball_model_path=args.ball_model, player_model_path=args.player_model,

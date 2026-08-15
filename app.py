@@ -94,9 +94,7 @@ def default_homography(width: int, height: int):
     which has not been built yet. Until then, court-position and possession
     output from the web app should be treated as approximate.
     """
-    image_points = [(0, height), (width, height), (0, 0), (width, 0)]
-    landmark_names = ["baseline_left", "baseline_right", "halfcourt_left", "halfcourt_right"]
-    return courtiq_core.compute_homography(image_points, landmark_names)
+    return courtiq_core.default_full_frame_homography(width, height)
 
 
 def decisions_to_actions(data, interval=5.0):
