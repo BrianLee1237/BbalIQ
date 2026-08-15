@@ -14,16 +14,16 @@ if not ok:
 
 debug = c.court_quad_debug(frame)
 
-print(f"color mask coverage:     {debug['color_coverage']:.1%} of frame")
-print(f"smooth (low-edge) mask:  {debug['smooth_coverage']:.1%} of frame")
-print(f"combined (color+smooth): {debug['combined_coverage']:.1%} of frame")
-print(f"largest contour (post-opening): {debug['largest_contour_fraction']:.1%} of frame")
+print(f"color mask coverage:        {debug['color_coverage']:.1%} of frame")
+print(f"smooth (low-edge) coverage: {debug['smooth_coverage']:.1%} of frame (diagnostic only)")
+print(f"morphed color mask:         {debug['morphed_coverage']:.1%} of frame")
+print(f"accepted region:            {debug['largest_contour_fraction']:.1%} of frame")
 if debug["reason"]:
     print(f"FAILED: {debug['reason']}")
 else:
     print("Found a quad.")
 
-for name in ("color_mask", "smooth_mask", "combined_mask", "opened_mask"):
+for name in ("color_mask", "smooth_mask", "morphed_color_mask"):
     if debug[name] is not None:
         cv2.imwrite(f"debug_{name}.png", debug[name])
         print(f"Wrote debug_{name}.png")

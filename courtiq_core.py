@@ -392,11 +392,20 @@ def detect_court_quad(frame) -> Optional[list]:
 
 # Tunable as module-level constants (not buried in the function) so they
 # can be adjusted and re-tested without hunting through the function body.
+# Kernel sizes are FRACTIONS of frame width, not fixed pixel counts -- a
+# fixed "35px" kernel is a very different relative size on a 640px test
+# image vs. a real ~1850px video frame, which silently broke earlier tuning.
 COURT_HSV_LOWER = (5, 45, 80)
 COURT_HSV_UPPER = (30, 200, 255)
-COURT_EDGE_DENSITY_MAX = 0.08
-COURT_OPEN_KERNEL = 35
+COURT_EDGE_DENSITY_MAX_MEAN = 0.15  # per-region average busyness, not per-pixel
+COURT_CLOSE_KERNEL_FRACTION = 0.03
+COURT_OPEN_KERNEL_FRACTION = 0.03
 COURT_MIN_AREA_FRACTION = 0.15
+
+
+def _odd_kernel(size_px: float) -> int:
+    size = max(3, round(size_px))
+    return size if size % 2 == 1 else size + 1
 
 
 def court_quad_debug(frame) -> dict:
@@ -405,17 +414,36 @@ def court_quad_debug(frame) -> dict:
     tuning the thresholds above can be based on actual numbers (mask
     coverage %, contour area %) instead of guessing blind between runs.
     See visualize_court.py for how this gets displayed.
+
+    Design note: an earlier version combined the color mask and a
+    per-pixel "is this pixel smooth" mask with a strict AND. On real
+    footage that fragmented into dozens of small disconnected patches
+    (visually confirmed via court_quad_debug's own combined_mask output)
+    instead of one solid floor shape, because ANDing two independently
+    noisy per-pixel masks multiplies their noise rather than cancelling
+    it. Smoothness is now judged per candidate REGION (its average edge
+    density across the whole blob) instead of per pixel -- much more
+    forgiving of small noise inside an otherwise legitimate floor blob
+    (a player, a painted line, a glare spot) while still rejecting
+    genuinely busy regions like the crowd.
     """
     result = {
-        "quad": None, "color_mask": None, "smooth_mask": None, "combined_mask": None,
-        "opened_mask": None, "color_coverage": 0.0, "smooth_coverage": 0.0,
-        "combined_coverage": 0.0, "largest_contour_fraction": 0.0, "reason": None,
+        "quad": None,
+        "color_mask": None,            # raw HSV color threshold (per-pixel)
+        "smooth_mask": None,           # raw per-pixel edge-density threshold (diagnostic only, not used for the decision)
+        "morphed_color_mask": None,    # color mask after close+open -- what candidate regions are drawn from
+        "color_coverage": 0.0, "smooth_coverage": 0.0,
+        "morphed_coverage": 0.0, "largest_contour_fraction": 0.0, "reason": None,
     }
     if cv2 is None or np is None:
         result["reason"] = "opencv/numpy not available"
         return result
 
-    frame_area = frame.shape[0] * frame.shape[1]
+    height, width = frame.shape[:2]
+    frame_area = height * width
+    close_k = _odd_kernel(width * COURT_CLOSE_KERNEL_FRACTION)
+    open_k = _odd_kernel(width * COURT_OPEN_KERNEL_FRACTION)
+
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     color_mask = cv2.inRange(hsv, np.array(COURT_HSV_LOWER), np.array(COURT_HSV_UPPER))
     result["color_mask"] = color_mask
@@ -424,33 +452,56 @@ def court_quad_debug(frame) -> dict:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     edge_density = cv2.boxFilter(edges.astype(np.float32) / 255.0, -1, (31, 31))
-    smooth_mask = (edge_density < COURT_EDGE_DENSITY_MAX).astype(np.uint8) * 255
-    result["smooth_mask"] = smooth_mask
-    result["smooth_coverage"] = float((smooth_mask > 0).sum()) / frame_area
+    # Lenient per-pixel pre-filter: coarsely separates crowd from floor
+    # *before* morphology runs, so a color-based close() doesn't simply
+    # merge a same-colored, directly-adjacent crowd region into the floor
+    # blob (they'd be touching with no bridge to sever). Deliberately
+    # looser than the per-region check below (0.25 vs 0.15) so it doesn't
+    # also strip genuine floor detail (players, painted lines) the way the
+    # stricter 0.08 per-pixel version did.
+    pixel_smooth_mask = (edge_density < 0.25).astype(np.uint8) * 255
+    result["smooth_mask"] = ((edge_density < COURT_EDGE_DENSITY_MAX_MEAN).astype(np.uint8) * 255)
+    result["smooth_coverage"] = float((result["smooth_mask"] > 0).sum()) / frame_area
 
-    mask = cv2.bitwise_and(color_mask, smooth_mask)
-    result["combined_mask"] = mask
-    result["combined_coverage"] = float((mask > 0).sum()) / frame_area
-
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((COURT_OPEN_KERNEL, COURT_OPEN_KERNEL), np.uint8))
-    result["opened_mask"] = mask
+    # Bridge gaps (navy-paint key/logo areas, players, lines all punch
+    # holes in a wood-color-only mask) into solid candidate blobs, then
+    # remove small noise speckles.
+    mask = cv2.bitwise_and(color_mask, pixel_smooth_mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8))
+    result["morphed_color_mask"] = mask
+    result["morphed_coverage"] = float((mask > 0).sum()) / frame_area
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        result["reason"] = "no contours survived the opening step"
-        return result
-    largest = max(contours, key=cv2.contourArea)
-    largest_fraction = cv2.contourArea(largest) / frame_area
-    result["largest_contour_fraction"] = largest_fraction
-    if largest_fraction < COURT_MIN_AREA_FRACTION:
-        result["reason"] = f"largest surviving contour is only {largest_fraction:.1%} of the frame (< {COURT_MIN_AREA_FRACTION:.0%} minimum)"
+        result["reason"] = "no contours survived color masking + morphology"
         return result
 
-    peri = cv2.arcLength(largest, True)
-    approx = cv2.approxPolyDP(largest, 0.02 * peri, True)
+    # Rank candidates by area, then reject any whose average edge density
+    # (busyness) across its own area is too high -- this is what rejects
+    # the crowd/bleachers even where a candidate's color matched.
+    candidates = sorted(contours, key=cv2.contourArea, reverse=True)
+    accepted = None
+    for candidate in candidates:
+        area_fraction = cv2.contourArea(candidate) / frame_area
+        if area_fraction < COURT_MIN_AREA_FRACTION:
+            break  # sorted descending; nothing smaller will pass either
+        region_mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.drawContours(region_mask, [candidate], -1, 255, thickness=cv2.FILLED)
+        region_pixels = edge_density[region_mask > 0]
+        mean_busyness = float(region_pixels.mean()) if region_pixels.size else 1.0
+        if mean_busyness <= COURT_EDGE_DENSITY_MAX_MEAN:
+            accepted = candidate
+            result["largest_contour_fraction"] = area_fraction
+            break
+    if accepted is None:
+        result["reason"] = "no candidate region was both large enough and smooth enough on average"
+        return result
+
+    peri = cv2.arcLength(accepted, True)
+    approx = cv2.approxPolyDP(accepted, 0.02 * peri, True)
     if len(approx) != 4:
-        rect = cv2.minAreaRect(largest)
+        rect = cv2.minAreaRect(accepted)
         approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
     points = approx.reshape(-1, 2).astype(float)
