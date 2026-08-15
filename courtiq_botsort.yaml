@@ -28,3 +28,7 @@ gmc_method: sparseOptFlow
 proximity_thresh: 0.5
 appearance_thresh: 0.25
 with_reid: False
+model: auto  # ReID encoder path; unused while with_reid is False, but newer
+             # ultralytics versions read this field unconditionally in
+             # BOTSORT.__init__ and error (AttributeError on cfg.model) if
+             # it's missing from the tracker yaml entirely.
