@@ -583,6 +583,87 @@ def auto_homography(video_path: str) -> "np.ndarray":
     return compute_homography(quad, landmark_names)
 
 
+# ---------------------------------------------------------------------------
+# Third calibration option: a trained YOLOv8-pose court-keypoint model,
+# instead of classical-CV floor detection or manual clicking.
+#
+# Source: github.com/HanaFEKI/AI_BasketBall_Analysis_v1, whose
+# tactical_view/tactical_view.py computes a homography via
+# cv2.findHomography(image_points, court_points) with 18 positionally-
+# ordered court landmarks -- meaning the keypoint model's output indices
+# must match this exact order by construction (their own pipeline depends
+# on it). This list is that order, converted from their meters (a 28m x
+# 15m FIBA court) to feet and with x/y swapped to match this file's
+# convention (x = width axis 0-50ft, y = length axis 0-94ft; see
+# COURT_WIDTH_FT/COURT_LENGTH_FT -- a FIBA court's 49.2x91.9ft is close
+# enough to the NBA 50x94ft this file otherwise assumes that the existing
+# ON_COURT_MARGIN_FT tolerance absorbs the difference).
+#
+# NOT VALIDATED: the trained weights (a Google Drive link in that repo's
+# training/README.md, ambiguous -- only one link is given for three
+# different models) could not be downloaded or verified from the
+# environment this was written in (drive.google.com is blocked there).
+# Download it yourself, confirm it's actually the court-keypoint model
+# (not the player or ball detector), and validate against your own
+# footage with keypoint_model_homography() before trusting it -- same
+# rule as every other swapped-in model in this file.
+KEYPOINT_MODEL_COURT_POINTS_FT = [
+    (0.00, 0.00), (2.99, 0.00), (16.99, 0.00), (32.81, 0.00), (46.26, 0.00), (49.21, 0.00),
+    (49.21, 45.93), (0.00, 45.93),
+    (16.99, 19.00), (32.81, 19.00),
+    (49.21, 91.86), (46.26, 91.86), (32.81, 91.86), (16.99, 91.86), (2.99, 91.86), (0.00, 91.86),
+    (16.99, 72.87), (32.81, 72.87),
+]
+KEYPOINT_MODEL_CONF_THRESHOLD = 0.6
+
+
+def keypoint_model_homography(video_path: str, model_path: str, conf_threshold: float = KEYPOINT_MODEL_CONF_THRESHOLD) -> "np.ndarray":
+    """Compute a homography from a trained court-keypoint model's output on
+    the video's first frame, instead of classical-CV floor detection or
+    manual clicking. See the KEYPOINT_MODEL_COURT_POINTS_FT comment above
+    for the model this expects and what has (and hasn't) been verified.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    model = _load_model(model_path)
+    capture = cv2.VideoCapture(video_path)
+    ok, frame = capture.read()
+    capture.release()
+    if not ok:
+        raise RuntimeError(f"Could not read a frame from {video_path}.")
+
+    result = model(frame, verbose=False)[0]
+    if result.keypoints is None:
+        raise RuntimeError(
+            "The model produced no keypoints -- confirm model_path is actually the "
+            "court-keypoint model, not the player or ball detector."
+        )
+    xy = result.keypoints.xy[0].tolist()
+    conf = result.keypoints.conf[0].tolist() if result.keypoints.conf is not None else [1.0] * len(xy)
+
+    if len(xy) != len(KEYPOINT_MODEL_COURT_POINTS_FT):
+        raise RuntimeError(
+            f"Model produced {len(xy)} keypoints, expected {len(KEYPOINT_MODEL_COURT_POINTS_FT)}. "
+            f"This model's keypoint schema doesn't match what this function assumes -- "
+            f"do not trust the resulting homography."
+        )
+
+    image_points = [pt for pt, c in zip(xy, conf) if c >= conf_threshold]
+    court_points = [pt for pt, c in zip(KEYPOINT_MODEL_COURT_POINTS_FT, conf) if c >= conf_threshold]
+    if len(image_points) < 4:
+        raise RuntimeError(
+            f"Only {len(image_points)} keypoints were detected above conf_threshold={conf_threshold} "
+            f"(need >= 4). Lower conf_threshold, or this frame/model isn't confident enough."
+        )
+
+    src = np.array(image_points, dtype=np.float32)
+    dst = np.array(court_points, dtype=np.float32)
+    homography, _ = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+    if homography is None:
+        raise RuntimeError("cv2.findHomography could not compute a homography from the detected keypoints.")
+    return homography
+
+
 def project_point(homography: "np.ndarray", point) -> tuple:
     if np is None:
         raise RuntimeError("numpy is required to project points.")
@@ -1245,9 +1326,18 @@ def main():
              "classical-CV court-floor detection first, falling back to a full-frame "
              "guess if that fails. See auto_homography() for the accuracy trade-offs.",
     )
+    parser.add_argument(
+        "--keypoint-model", default=None,
+        help="Path to a trained court-keypoint model (see keypoint_model_homography() "
+             "and KEYPOINT_MODEL_COURT_POINTS_FT). Overrides --interactive/automatic "
+             "detection when set. UNVALIDATED against real footage -- verify the "
+             "detection rate/accuracy yourself before trusting it.",
+    )
     args = parser.parse_args()
 
-    if args.interactive:
+    if args.keypoint_model:
+        homography = keypoint_model_homography(args.video, args.keypoint_model)
+    elif args.interactive:
         homography = pick_corners_interactive(args.video)
     else:
         homography = auto_homography(args.video)
