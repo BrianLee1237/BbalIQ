@@ -79,6 +79,7 @@ DECISION_TITLES = {
     "open_teammate_ignored": "Open teammate ignored",
     "shot_selection": "Shot selection",
     "spacing": "Spacing",
+    "low_confidence": "Ball tracking too unreliable to grade",
 }
 
 

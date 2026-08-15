@@ -111,6 +111,21 @@ OPEN_TEAMMATE_HOLD_SECONDS = 1.5      # carrier must hold this long, ignoring it
 CONTESTED_SHOT_DEFENDER_FT = 4.0      # defender closer than this = contested
 BAD_SPACING_TEAMMATE_FT = 8.0         # same-team players closer than this = crowded
 
+# A possession ending "lost" (ball no longer tracked near any player) is
+# used as a proxy for a shot attempt, since tracks.json has no dedicated
+# shot-detection signal. But that proxy is only meaningful if the carrier
+# was actually within shooting range of the hoop when it happened --
+# otherwise "lost" usually just means the ball detector dropped the ball
+# mid-court, which is a tracking failure, not a shot.
+SHOT_RANGE_FT = 30.0  # beyond the 3-pt line (23.75 ft) plus margin
+
+# Below this on-court ball detection rate, the ball's position data is too
+# sparse/noisy to trust for possession- or ball-dependent grading (see the
+# BALL_MODEL_PATH limitation in the module docstring). Ball-dependent
+# decision types are skipped entirely rather than emitted with false
+# confidence; a single low_confidence decision explains why.
+MIN_RELIABLE_BALL_DETECTION_RATE = 0.15
+
 
 # ---------------------------------------------------------------------------
 # Data schema (Stage 1 output contract -- do not change without a reason)
@@ -594,6 +609,32 @@ def grade_decisions(data: TracksData) -> list:
 
     decisions = []
 
+    # Every possession-based rule below (open_teammate_ignored, shot_selection)
+    # depends on knowing who's holding the ball, which depends on the ball
+    # actually being detected. Below MIN_RELIABLE_BALL_DETECTION_RATE, the
+    # possession segmentation this run produced is mostly detector dropout,
+    # not real possession changes -- grading on it would just relabel noise
+    # with false confidence. Skip those rules and say so explicitly, rather
+    # than emit decisions built on data known to be unreliable.
+    if data.ball_detection_rate < MIN_RELIABLE_BALL_DETECTION_RATE:
+        decisions.append({
+            "type": "low_confidence",
+            "verdict": "uncertain",
+            "frame": 0,
+            "t": 0.0,
+            "reason": (
+                f"On-court ball detection rate for this run was "
+                f"{data.ball_detection_rate:.1%}, below the "
+                f"{MIN_RELIABLE_BALL_DETECTION_RATE:.0%} reliability threshold. "
+                f"Ball-dependent grading (open teammate ignored, shot selection) "
+                f"was skipped for this video -- see the BALL_MODEL_PATH "
+                f"limitation in courtiq_core.py. Only same-team spacing, which "
+                f"doesn't need the ball, was graded below."
+            ),
+        })
+        decisions.extend(grade_spacing(data, players_by_frame, team_by_track))
+        return decisions
+
     # Rule: open teammate ignored. For each possession, check whether the
     # carrier held the ball long enough while a teammate was both
     # (a) more open than their nearest defender by OPEN_TEAMMATE_SEPARATION_FT
@@ -638,6 +679,12 @@ def grade_decisions(data: TracksData) -> list:
     # Rule: contested vs. open shot, evaluated at possessions that end
     # "lost" (ball possession disappears -- our best proxy for a shot,
     # since we have no separate shot-detection signal in tracks.json).
+    # Only count it as a shot if the carrier was actually within shooting
+    # range of the hoop when possession was lost -- a "lost" possession at
+    # half-court is a tracking dropout, not a shot attempt, and grading it
+    # as one would be exactly the kind of invented label this pipeline is
+    # supposed to avoid.
+    hoop_x, hoop_y = COURT_LANDMARKS["hoop"]
     for poss in data.possessions:
         if poss.end_reason != "lost" or not poss.carrier_track_ids:
             continue
@@ -646,6 +693,9 @@ def grade_decisions(data: TracksData) -> list:
         carrier = next((p for p in frame_players if p.track_id == carrier_id), None)
         if carrier is None:
             continue
+        dist_to_hoop = math.hypot(carrier.x_ft - hoop_x, carrier.y_ft - hoop_y)
+        if dist_to_hoop > SHOT_RANGE_FT:
+            continue  # too far from the hoop to plausibly be a shot; skip rather than mislabel
         _, defenders = _teammates_and_defenders(carrier, frame_players, team_by_track)
         nearest = _nearest_defender_dist((carrier.x_ft, carrier.y_ft), defenders)
         if nearest is None:
@@ -658,13 +708,23 @@ def grade_decisions(data: TracksData) -> list:
             "t": poss.end_t,
             "carrier_track_id": carrier_id,
             "nearest_defender_ft": round(nearest, 1),
+            "distance_to_hoop_ft": round(dist_to_hoop, 1),
             "reason": (
-                f"Nearest defender was {nearest:.1f} ft away at the end of possession "
-                f"({'contested' if contested else 'open'})."
+                f"Possession ended {dist_to_hoop:.1f} ft from the hoop with the nearest "
+                f"defender {nearest:.1f} ft away ({'contested' if contested else 'open'})."
             ),
         })
 
-    # Rule: spacing quality, sampled every ~1s, same-team pairwise distance only.
+    decisions.extend(grade_spacing(data, players_by_frame, team_by_track))
+    return decisions
+
+
+def grade_spacing(data: TracksData, players_by_frame: dict, team_by_track: dict) -> list:
+    """Same-team pairwise distance, sampled every ~1s. Doesn't depend on
+    ball detection at all, so this still runs even when ball tracking is
+    too unreliable to trust for the other rules.
+    """
+    decisions = []
     sample_stride = max(1, int(round(data.fps))) if data.fps else 30
     for frame in sorted(players_by_frame.keys())[::sample_stride]:
         frame_players = players_by_frame[frame]
@@ -691,7 +751,6 @@ def grade_decisions(data: TracksData) -> list:
                     "mean_teammate_distance_ft": round(mean_dist, 1),
                     "reason": f"Team {team} averaged {mean_dist:.1f} ft of separation (< {BAD_SPACING_TEAMMATE_FT} ft threshold).",
                 })
-
     return decisions
 
 
