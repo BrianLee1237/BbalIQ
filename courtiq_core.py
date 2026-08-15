@@ -98,6 +98,11 @@ TRACKER_CONFIG = os.environ.get(
     "COURTIQ_TRACKER_CONFIG", str(Path(__file__).resolve().parent / "courtiq_bytetrack.yaml")
 )
 
+# Tracks shorter than this are dropped as noise (misdetections, motion-blur
+# false positives, ID-switch fragments) rather than counted as real
+# players -- see the filter in run_pipeline() for why.
+MIN_TRACK_DURATION_SECONDS = float(os.environ.get("COURTIQ_MIN_TRACK_SECONDS", "1.0"))
+
 # Only ball detection is strided (run every Nth frame), not player
 # tracking. Player tracking runs on every single frame -- ByteTrack
 # matches players between calls by position/overlap, and skipping frames
@@ -599,6 +604,23 @@ def run_pipeline(
             progress_cb(frame_idx, total)
 
     capture.release()
+
+    # Drop tracks that never persisted long enough to plausibly be a real
+    # player -- a real player is on court continuously across a possession,
+    # not detected for a handful of frames. Short-lived tracks are almost
+    # always detector noise (a misdetection, motion blur, momentary false
+    # positive) or a fragment left over from an ID switch. Filtering these
+    # out before team assignment also keeps that noise from polluting the
+    # jersey-color KMeans clustering.
+    survivors = {
+        track_id
+        for track_id in track_first_seen
+        if (track_last_seen[track_id] - track_first_seen[track_id]) / fps >= MIN_TRACK_DURATION_SECONDS
+    }
+    track_colors = {tid: colors for tid, colors in track_colors.items() if tid in survivors}
+    player_samples = [s for s in player_samples if s.track_id in survivors]
+    track_first_seen = {tid: v for tid, v in track_first_seen.items() if tid in survivors}
+    track_last_seen = {tid: v for tid, v in track_last_seen.items() if tid in survivors}
 
     team_by_track = assign_teams({
         track_id: sum(colors) / len(colors) for track_id, colors in track_colors.items() if colors
