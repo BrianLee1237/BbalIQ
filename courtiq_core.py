@@ -85,12 +85,16 @@ DETECT_CONF = float(os.environ.get("COURTIQ_DETECT_CONF", "0.25"))
 BALL_MODEL_PATH = os.environ.get("COURTIQ_BALL_MODEL", "yolo11n.pt")
 PLAYER_MODEL_PATH = os.environ.get("COURTIQ_PLAYER_MODEL", "yolo11n.pt")
 
-# Every frame gets two YOLO inference calls (player tracking + ball
-# detection), which is the main cost of a full analysis run. Processing
-# every Nth frame instead cuts that cost roughly proportionally, at some
-# loss of possession-timing precision between sampled frames. Skipped
-# frames are still grabbed (not decoded) so video timing (`t`) stays
-# accurate to the real frame index.
+# Only ball detection is strided (run every Nth frame), not player
+# tracking. Player tracking runs on every single frame -- ByteTrack
+# matches players between calls by position/overlap, and skipping frames
+# there multiplies apparent player displacement between calls, breaking
+# that matching and fragmenting track IDs (measured: ~141 tracks for what
+# should be ~10-12 players+refs, when both were strided together).
+# Skipping only ball detection still cuts total inference cost
+# meaningfully, since the ball doesn't need frame-to-frame continuity the
+# same way -- possession logic already tolerates gaps via
+# POSSESSION_HOLD_FRAMES.
 FRAME_STRIDE = max(1, int(os.environ.get("COURTIQ_FRAME_STRIDE", "3")))
 
 # Standard NBA half-court reference dimensions, in feet, used as defaults
@@ -418,15 +422,15 @@ def run_pipeline(
     while True:
         if max_frames and frame_idx >= max_frames:
             break
-        ok = capture.grab()
-        if not ok:
-            break
-        if frame_idx % FRAME_STRIDE != 0:
-            frame_idx += 1
-            if progress_cb and total:
-                progress_cb(frame_idx, total)
-            continue
-        ok, frame = capture.retrieve()
+        # Every frame is decoded and given to the player tracker: ByteTrack
+        # matches players between consecutive calls by position/overlap, and
+        # skipping frames there (as this loop used to do for both models)
+        # multiplies how far players appear to move between calls, breaking
+        # that matching and fragmenting track IDs. Only ball detection --
+        # which doesn't need frame-to-frame continuity the same way, since
+        # possession logic already tolerates gaps via POSSESSION_HOLD_FRAMES
+        # -- is strided, to still cut overall inference cost.
+        ok, frame = capture.read()
         if not ok:
             break
         t = frame_idx / fps
@@ -458,19 +462,21 @@ def run_pipeline(
 
         # Ball detection (separate model call so a swapped-in basketball
         # model can be used here without touching player tracking above).
-        ball_result = ball_model(frame, classes=[ball_class], conf=DETECT_CONF, verbose=False)[0]
-        ball_x_ft = ball_y_ft = None
-        detected = False
-        if ball_result.boxes is not None and len(ball_result.boxes) > 0:
-            box = max(ball_result.boxes, key=lambda b: float(b.conf[0]))
-            x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
-            ball_x_ft, ball_y_ft = project_point(homography, ((x1 + x2) / 2, (y1 + y2) / 2))
-            if is_on_court(ball_x_ft, ball_y_ft):
-                detected = True
-                ball_detected_count += 1
-            else:
-                ball_x_ft = ball_y_ft = None
-        ball_samples.append(BallSample(frame=frame_idx, t=t, x_ft=ball_x_ft, y_ft=ball_y_ft, detected=detected))
+        # Strided: only every FRAME_STRIDE'th frame runs ball inference.
+        if frame_idx % FRAME_STRIDE == 0:
+            ball_result = ball_model(frame, classes=[ball_class], conf=DETECT_CONF, verbose=False)[0]
+            ball_x_ft = ball_y_ft = None
+            detected = False
+            if ball_result.boxes is not None and len(ball_result.boxes) > 0:
+                box = max(ball_result.boxes, key=lambda b: float(b.conf[0]))
+                x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+                ball_x_ft, ball_y_ft = project_point(homography, ((x1 + x2) / 2, (y1 + y2) / 2))
+                if is_on_court(ball_x_ft, ball_y_ft):
+                    detected = True
+                    ball_detected_count += 1
+                else:
+                    ball_x_ft = ball_y_ft = None
+            ball_samples.append(BallSample(frame=frame_idx, t=t, x_ft=ball_x_ft, y_ft=ball_y_ft, detected=detected))
 
         frame_idx += 1
         if progress_cb and total:
