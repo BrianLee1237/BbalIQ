@@ -21,16 +21,24 @@ Pipeline:
   7. (Stage 2) Grade decisions during each possession using rules that are
      directly computable from the tracked data above -- no invented labels.
 
-KNOWN LIMITATION (flagged, not hidden): the ball detector below defaults to
-COCO's generic "sports ball" class (id 32) via BALL_MODEL_PATH=yolo11n.pt.
-COCO was never trained on basketball-specific footage and is expected to
-perform poorly (single-digit percent detection rate on in-flight frames).
-Swap in a basketball-domain-trained .pt (e.g. a Roboflow Universe model
-with ball/rim/player classes) by setting the BALL_MODEL_PATH environment
-variable, or passing --ball-model on the CLI, once one has been validated
-against real footage per the CourtIQ build brief Stage 1.5. This has NOT
-been done yet in this codebase -- do not assume the ball detection rate is
-usable until it is re-measured with a basketball-trained model.
+BALL MODEL: by default this still falls back to COCO's generic "sports
+ball" class via BALL_MODEL_PATH=yolo11n.pt, which is expected to perform
+poorly on basketball footage (COCO was never trained on a basketball
+specifically). Run `python3 setup_ball_model.py` once to download a
+basketball-domain-trained model (MIT-licensed, from
+github.com/abdullahtarek/basketball_analysis) to models/basketball_ball.pt,
+then set COURTIQ_BALL_MODEL=models/basketball_ball.pt (or pass
+--ball-model on the CLI) to use it. That download could not be validated
+against this project's own footage from the environment this code was
+written in (no network path to fetch it, no test video available there) --
+run `python3 courtiq_core.py <video> --ball-model models/basketball_ball.pt`
+on your own footage and check the printed "Ball detection rate" before
+trusting downstream possession/decision output, per the CourtIQ build
+brief's Stage 1.5 requirement to validate on real footage before relying
+on it. The ball class index is resolved by name (see resolve_ball_class),
+not hardcoded, so this works regardless of which class index the swapped
+model uses -- override with COURTIQ_BALL_CLASS if name-matching ever picks
+the wrong one.
 """
 from __future__ import annotations
 
@@ -64,7 +72,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 PERSON_CLASS = 0
-BALL_CLASS = 32  # COCO "sports ball" -- see module docstring limitation.
+BALL_CLASS_FALLBACK = 32  # COCO "sports ball" index, used only if a model's
+                           # class names don't contain a ball-like name below.
+# Basketball-trained models (e.g. Roboflow Universe exports, or
+# github.com/abdullahtarek/basketball_analysis) name their ball class
+# something like "Ball" or "basketball" rather than reusing COCO's index 32.
+# resolve_ball_class() below looks the class index up by name so swapping
+# BALL_MODEL_PATH doesn't also require guessing a new hardcoded index.
+BALL_CLASS_NAMES = {"ball", "basketball", "sports ball"}
 
 DETECT_CONF = float(os.environ.get("COURTIQ_DETECT_CONF", "0.25"))
 BALL_MODEL_PATH = os.environ.get("COURTIQ_BALL_MODEL", "yolo11n.pt")
@@ -330,6 +345,23 @@ def _load_model(path: str):
     return YOLO(str(weights))
 
 
+def resolve_ball_class(model) -> int:
+    """Find the ball class index by name rather than assuming COCO's index
+    32. Custom basketball-trained models (Roboflow exports, or e.g.
+    github.com/abdullahtarek/basketball_analysis) typically name their ball
+    class "Ball"/"basketball" at whatever index their training data used.
+    An explicit COURTIQ_BALL_CLASS env var always wins if set.
+    """
+    override = os.environ.get("COURTIQ_BALL_CLASS")
+    if override is not None:
+        return int(override)
+    names = getattr(model, "names", None) or {}
+    for idx, name in names.items():
+        if str(name).strip().lower() in BALL_CLASS_NAMES:
+            return int(idx)
+    return BALL_CLASS_FALLBACK
+
+
 def run_pipeline(
     video_path: str,
     homography: "np.ndarray",
@@ -349,6 +381,7 @@ def run_pipeline(
 
     player_model = _load_model(player_model_path)
     ball_model = player_model if ball_model_path == player_model_path else _load_model(ball_model_path)
+    ball_class = resolve_ball_class(ball_model)
 
     capture = cv2.VideoCapture(video_path)
     if not capture.isOpened():
@@ -408,7 +441,7 @@ def run_pipeline(
 
         # Ball detection (separate model call so a swapped-in basketball
         # model can be used here without touching player tracking above).
-        ball_result = ball_model(frame, classes=[BALL_CLASS], conf=DETECT_CONF, verbose=False)[0]
+        ball_result = ball_model(frame, classes=[ball_class], conf=DETECT_CONF, verbose=False)[0]
         ball_x_ft = ball_y_ft = None
         detected = False
         if ball_result.boxes is not None and len(ball_result.boxes) > 0:
