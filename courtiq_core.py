@@ -397,15 +397,66 @@ def detect_court_quad(frame) -> Optional[list]:
 # image vs. a real ~1850px video frame, which silently broke earlier tuning.
 COURT_HSV_LOWER = (5, 45, 80)
 COURT_HSV_UPPER = (30, 200, 255)
-COURT_EDGE_DENSITY_MAX_MEAN = 0.15  # per-region average busyness, not per-pixel
 COURT_CLOSE_KERNEL_FRACTION = 0.03
 COURT_OPEN_KERNEL_FRACTION = 0.03
 COURT_MIN_AREA_FRACTION = 0.15
+# A floor row is mostly one continuous wood-colored span (interrupted only
+# by players/painted lines); a crowd row is chopped into many short
+# wood-matching fragments (individual people's clothing) with gaps.
+# Longest-unbroken-run-per-row is still a color signal (unlike per-pixel
+# edge density, which measured on real compressed video as ~83% "smooth"
+# even over the crowd -- video compression flattens exactly the
+# fine-texture detail edge density depends on, so it doesn't reliably
+# survive real footage). This should be more robust to that.
+COURT_ROW_RUN_MIN_FRACTION = 0.35  # longest run must span this much of the row's width
+COURT_ROW_SUSTAIN_COUNT = 15       # ...for this many consecutive rows, to count as "floor starts here"
 
 
 def _odd_kernel(size_px: float) -> int:
     size = max(3, round(size_px))
     return size if size % 2 == 1 else size + 1
+
+
+def _longest_run_fraction_per_row(mask) -> "np.ndarray":
+    """For each row, the longest unbroken run of nonzero pixels, as a
+    fraction of the row's width. Vectorized: find run boundaries via
+    diff() of the binarized row instead of a per-pixel Python loop.
+    """
+    height, width = mask.shape
+    binary = (mask > 0).astype(np.int8)
+    fractions = np.zeros(height, dtype=np.float32)
+    for y in range(height):
+        row = binary[y]
+        if not row.any():
+            continue
+        padded = np.concatenate(([0], row, [0]))
+        diffs = np.diff(padded)
+        starts = np.flatnonzero(diffs == 1)
+        ends = np.flatnonzero(diffs == -1)
+        fractions[y] = float((ends - starts).max()) / width
+    return fractions
+
+
+def find_court_top_row(color_mask) -> Optional[int]:
+    """Scan down from the top of the frame for the first row where the
+    longest unbroken wood-colored run is wide AND stays wide for
+    COURT_ROW_SUSTAIN_COUNT consecutive rows -- a single wide row could
+    just be a lucky bleacher-color alignment; a sustained run of them is
+    the actual floor starting. Returns the row index, or None if no such
+    transition was found (the color signal never looked floor-like).
+    """
+    run_fraction = _longest_run_fraction_per_row(color_mask)
+    height = len(run_fraction)
+    wide = run_fraction >= COURT_ROW_RUN_MIN_FRACTION
+    run_length = 0
+    for y in range(height):
+        if wide[y]:
+            run_length += 1
+            if run_length >= COURT_ROW_SUSTAIN_COUNT:
+                return y - COURT_ROW_SUSTAIN_COUNT + 1
+        else:
+            run_length = 0
+    return None
 
 
 def court_quad_debug(frame) -> dict:
@@ -415,25 +466,34 @@ def court_quad_debug(frame) -> dict:
     coverage %, contour area %) instead of guessing blind between runs.
     See visualize_court.py for how this gets displayed.
 
-    Design note: an earlier version combined the color mask and a
-    per-pixel "is this pixel smooth" mask with a strict AND. On real
-    footage that fragmented into dozens of small disconnected patches
-    (visually confirmed via court_quad_debug's own combined_mask output)
-    instead of one solid floor shape, because ANDing two independently
-    noisy per-pixel masks multiplies their noise rather than cancelling
-    it. Smoothness is now judged per candidate REGION (its average edge
-    density across the whole blob) instead of per pixel -- much more
-    forgiving of small noise inside an otherwise legitimate floor blob
-    (a player, a painted line, a glare spot) while still rejecting
-    genuinely busy regions like the crowd.
+    Design note: two earlier versions relied on per-pixel edge density
+    ("is this pixel visually busy") to separate crowd from floor. Measured
+    on real, compressed footage, edge density was nearly useless -- 83.5%
+    of the ENTIRE frame (crowd included) registered as "smooth," because
+    video compression flattens exactly the fine high-frequency texture
+    detail that signal depended on. It worked on clean synthetic test
+    images and failed on the real thing, which is exactly the "looked
+    right in code, failed on real data" trap this project has hit twice
+    before with other components.
+
+    This version uses a color-only signal instead: the longest unbroken
+    horizontal run of wood-colored pixels per image row. A real floor row
+    is mostly one continuous span (interrupted only by players/painted
+    lines); a crowd row is chopped into many short wood-matching fragments
+    (individual people's clothing) with gaps between them. Still
+    fundamentally a color measurement, so it should survive compression
+    far better than fine per-pixel texture did. find_court_top_row() finds
+    where a sustained run of "wide" rows begins, and everything above that
+    row is zeroed out of the mask before contour detection -- explicitly
+    excluding the crowd/bleachers by geometry-of-the-color-signal rather
+    than by texture.
     """
     result = {
         "quad": None,
         "color_mask": None,            # raw HSV color threshold (per-pixel)
-        "smooth_mask": None,           # raw per-pixel edge-density threshold (diagnostic only, not used for the decision)
-        "morphed_color_mask": None,    # color mask after close+open -- what candidate regions are drawn from
-        "color_coverage": 0.0, "smooth_coverage": 0.0,
-        "morphed_coverage": 0.0, "largest_contour_fraction": 0.0, "reason": None,
+        "morphed_color_mask": None,    # color mask, crowd rows zeroed out, after close+open
+        "color_coverage": 0.0, "morphed_coverage": 0.0,
+        "largest_contour_fraction": 0.0, "court_top_row": None, "reason": None,
     }
     if cv2 is None or np is None:
         result["reason"] = "opencv/numpy not available"
@@ -449,24 +509,12 @@ def court_quad_debug(frame) -> dict:
     result["color_mask"] = color_mask
     result["color_coverage"] = float((color_mask > 0).sum()) / frame_area
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    edge_density = cv2.boxFilter(edges.astype(np.float32) / 255.0, -1, (31, 31))
-    # Lenient per-pixel pre-filter: coarsely separates crowd from floor
-    # *before* morphology runs, so a color-based close() doesn't simply
-    # merge a same-colored, directly-adjacent crowd region into the floor
-    # blob (they'd be touching with no bridge to sever). Deliberately
-    # looser than the per-region check below (0.25 vs 0.15) so it doesn't
-    # also strip genuine floor detail (players, painted lines) the way the
-    # stricter 0.08 per-pixel version did.
-    pixel_smooth_mask = (edge_density < 0.25).astype(np.uint8) * 255
-    result["smooth_mask"] = ((edge_density < COURT_EDGE_DENSITY_MAX_MEAN).astype(np.uint8) * 255)
-    result["smooth_coverage"] = float((result["smooth_mask"] > 0).sum()) / frame_area
+    top_row = find_court_top_row(color_mask)
+    result["court_top_row"] = top_row
+    mask = color_mask.copy()
+    if top_row is not None and top_row > 0:
+        mask[:top_row, :] = 0
 
-    # Bridge gaps (navy-paint key/logo areas, players, lines all punch
-    # holes in a wood-color-only mask) into solid candidate blobs, then
-    # remove small noise speckles.
-    mask = cv2.bitwise_and(color_mask, pixel_smooth_mask)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8))
     result["morphed_color_mask"] = mask
@@ -477,25 +525,11 @@ def court_quad_debug(frame) -> dict:
         result["reason"] = "no contours survived color masking + morphology"
         return result
 
-    # Rank candidates by area, then reject any whose average edge density
-    # (busyness) across its own area is too high -- this is what rejects
-    # the crowd/bleachers even where a candidate's color matched.
-    candidates = sorted(contours, key=cv2.contourArea, reverse=True)
-    accepted = None
-    for candidate in candidates:
-        area_fraction = cv2.contourArea(candidate) / frame_area
-        if area_fraction < COURT_MIN_AREA_FRACTION:
-            break  # sorted descending; nothing smaller will pass either
-        region_mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.drawContours(region_mask, [candidate], -1, 255, thickness=cv2.FILLED)
-        region_pixels = edge_density[region_mask > 0]
-        mean_busyness = float(region_pixels.mean()) if region_pixels.size else 1.0
-        if mean_busyness <= COURT_EDGE_DENSITY_MAX_MEAN:
-            accepted = candidate
-            result["largest_contour_fraction"] = area_fraction
-            break
-    if accepted is None:
-        result["reason"] = "no candidate region was both large enough and smooth enough on average"
+    accepted = max(contours, key=cv2.contourArea)
+    area_fraction = cv2.contourArea(accepted) / frame_area
+    result["largest_contour_fraction"] = area_fraction
+    if area_fraction < COURT_MIN_AREA_FRACTION:
+        result["reason"] = f"largest surviving contour is only {area_fraction:.1%} of the frame (< {COURT_MIN_AREA_FRACTION:.0%} minimum)"
         return result
 
     peri = cv2.arcLength(accepted, True)
