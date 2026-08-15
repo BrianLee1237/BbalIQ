@@ -46,10 +46,16 @@ import argparse
 import json
 import math
 import os
+import tempfile
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 try:
     import cv2
@@ -101,6 +107,16 @@ PLAYER_MODEL_PATH = os.environ.get("COURTIQ_PLAYER_MODEL", "yolo11n.pt")
 TRACKER_CONFIG = os.environ.get(
     "COURTIQ_TRACKER_CONFIG", str(Path(__file__).resolve().parent / "courtiq_botsort.yaml")
 )
+
+# courtiq_botsort.yaml / courtiq_bytetrack.yaml set track_buffer assuming
+# ~30fps video. This ultralytics version does NOT scale that by the
+# video's actual frame rate (confirmed by reading byte_tracker.py:
+# max_frames_lost = args.track_buffer, used as a raw frame count) -- on
+# footage shot at a materially different fps, the real-world occlusion
+# tolerance ends up wrong (e.g. measured on real ~53fps footage: the
+# intended ~3s buffer was actually only ~1.7s). scaled_tracker_config()
+# rewrites track_buffer to match each video's real fps at analysis time.
+TARGET_OCCLUSION_SECONDS = float(os.environ.get("COURTIQ_OCCLUSION_SECONDS", "3.0"))
 
 # Tracks shorter than this are dropped as noise (misdetections, motion-blur
 # false positives, ID-switch fragments) rather than counted as real
@@ -517,6 +533,25 @@ def _load_model(path: str):
     return YOLO(str(weights))
 
 
+def scaled_tracker_config(base_path: str, fps: float) -> str:
+    """Rewrite track_buffer in the tracker config to TARGET_OCCLUSION_SECONDS
+    worth of *this video's actual frame rate*, not a fixed frame count
+    tuned for an assumed ~30fps. See the TARGET_OCCLUSION_SECONDS comment
+    for why this matters -- this ultralytics version doesn't do this
+    scaling itself. Writes a temp file (ultralytics' tracker= arg expects
+    a path) and returns its path; the base config on disk is untouched.
+    """
+    if yaml is None:
+        return base_path  # no PyYAML available; fall back to the fixed config as-is
+    with open(base_path) as f:
+        cfg = yaml.safe_load(f)
+    cfg["track_buffer"] = max(1, round(TARGET_OCCLUSION_SECONDS * fps))
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+    yaml.safe_dump(cfg, tmp)
+    tmp.close()
+    return tmp.name
+
+
 def resolve_ball_class(model) -> int:
     """Find the ball class index by name rather than assuming COCO's index
     32. Custom basketball-trained models (Roboflow exports, or e.g.
@@ -561,6 +596,8 @@ def run_pipeline(
     fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     total = min(frame_count, max_frames) if max_frames else frame_count
+    tracker_config = scaled_tracker_config(TRACKER_CONFIG, fps)
+    print(f"[courtiq_core] Video fps={fps:.1f} -> tracker occlusion buffer scaled to {TARGET_OCCLUSION_SECONDS}s of real time.")
 
     track_first_seen = {}
     track_last_seen = {}
@@ -588,7 +625,7 @@ def run_pipeline(
 
         # Player detection + tracking (ByteTrack keeps IDs stable across frames).
         track_result = player_model.track(
-            frame, classes=[PERSON_CLASS], conf=PLAYER_DETECT_CONF, tracker=TRACKER_CONFIG,
+            frame, classes=[PERSON_CLASS], conf=PLAYER_DETECT_CONF, tracker=tracker_config,
             persist=True, verbose=False,
         )[0]
 
