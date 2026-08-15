@@ -1,0 +1,27 @@
+# Tuned ByteTrack config for CourtIQ player tracking, based on ultralytics'
+# default bytetrack.yaml. Basketball has heavy, frequent occlusion (players
+# clustering under the rim, screens, switches) that the untouched defaults
+# handle poorly -- measured 141-370 fragmented tracks on real footage for
+# what should be ~10-12 players+refs.
+#
+# Changes from ultralytics' default, and why:
+#   track_buffer: 30 -> 90   Frames a lost track is kept alive waiting for
+#                            re-association before being dropped and
+#                            replaced by a new ID on reappearance. 30
+#                            frames (~1s at 30fps) is too short for a
+#                            player who's briefly occluded under the
+#                            basket; 90 (~3s) gives real occlusions time
+#                            to resolve without spawning a new ID.
+#   new_track_thresh: 0.6 -> 0.7   Makes it harder for a noisy/low-confidence
+#                            detection to spawn a brand-new track instead of
+#                            being treated as a re-detection of an existing
+#                            one. Trade-off: a genuine substitution entering
+#                            the frame needs a slightly more confident
+#                            detection before getting its own track.
+tracker_type: bytetrack
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.7
+track_buffer: 90
+match_thresh: 0.8
+fuse_score: True

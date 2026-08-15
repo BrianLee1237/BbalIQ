@@ -81,9 +81,22 @@ BALL_CLASS_FALLBACK = 32  # COCO "sports ball" index, used only if a model's
 # BALL_MODEL_PATH doesn't also require guessing a new hardcoded index.
 BALL_CLASS_NAMES = {"ball", "basketball", "sports ball"}
 
-DETECT_CONF = float(os.environ.get("COURTIQ_DETECT_CONF", "0.25"))
+# Separate confidence thresholds for player vs. ball detection -- they were
+# previously shared (COURTIQ_DETECT_CONF), but a low threshold that's
+# needed to catch a small, fast-moving ball also lets through a lot of
+# noisy low-confidence person detections (partial occlusions, motion blur),
+# which spawn spurious short-lived tracks and inflate fragmentation.
+PLAYER_DETECT_CONF = float(os.environ.get("COURTIQ_PLAYER_CONF", os.environ.get("COURTIQ_DETECT_CONF", "0.4")))
+BALL_DETECT_CONF = float(os.environ.get("COURTIQ_BALL_CONF", os.environ.get("COURTIQ_DETECT_CONF", "0.25")))
 BALL_MODEL_PATH = os.environ.get("COURTIQ_BALL_MODEL", "yolo11n.pt")
 PLAYER_MODEL_PATH = os.environ.get("COURTIQ_PLAYER_MODEL", "yolo11n.pt")
+
+# Bundled, occlusion-tuned ByteTrack config (see courtiq_bytetrack.yaml for
+# what changed from ultralytics' default and why). Override with
+# COURTIQ_TRACKER_CONFIG to point at a different tracker yaml entirely.
+TRACKER_CONFIG = os.environ.get(
+    "COURTIQ_TRACKER_CONFIG", str(Path(__file__).resolve().parent / "courtiq_bytetrack.yaml")
+)
 
 # Only ball detection is strided (run every Nth frame), not player
 # tracking. Player tracking runs on every single frame -- ByteTrack
@@ -540,7 +553,7 @@ def run_pipeline(
 
         # Player detection + tracking (ByteTrack keeps IDs stable across frames).
         track_result = player_model.track(
-            frame, classes=[PERSON_CLASS], conf=DETECT_CONF, tracker="bytetrack.yaml",
+            frame, classes=[PERSON_CLASS], conf=PLAYER_DETECT_CONF, tracker=TRACKER_CONFIG,
             persist=True, verbose=False,
         )[0]
 
@@ -567,7 +580,7 @@ def run_pipeline(
         # model can be used here without touching player tracking above).
         # Strided: only every FRAME_STRIDE'th frame runs ball inference.
         if frame_idx % FRAME_STRIDE == 0:
-            ball_result = ball_model(frame, classes=[ball_class], conf=DETECT_CONF, verbose=False)[0]
+            ball_result = ball_model(frame, classes=[ball_class], conf=BALL_DETECT_CONF, verbose=False)[0]
             ball_x_ft = ball_y_ft = None
             detected = False
             if ball_result.boxes is not None and len(ball_result.boxes) > 0:
