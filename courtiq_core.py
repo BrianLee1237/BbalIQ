@@ -70,6 +70,14 @@ DETECT_CONF = float(os.environ.get("COURTIQ_DETECT_CONF", "0.25"))
 BALL_MODEL_PATH = os.environ.get("COURTIQ_BALL_MODEL", "yolo11n.pt")
 PLAYER_MODEL_PATH = os.environ.get("COURTIQ_PLAYER_MODEL", "yolo11n.pt")
 
+# Every frame gets two YOLO inference calls (player tracking + ball
+# detection), which is the main cost of a full analysis run. Processing
+# every Nth frame instead cuts that cost roughly proportionally, at some
+# loss of possession-timing precision between sampled frames. Skipped
+# frames are still grabbed (not decoded) so video timing (`t`) stays
+# accurate to the real frame index.
+FRAME_STRIDE = max(1, int(os.environ.get("COURTIQ_FRAME_STRIDE", "3")))
+
 # Standard NBA half-court reference dimensions, in feet, used as defaults
 # for the landmark picker. Full court is 94x50; teams generally care about
 # the half being played on.
@@ -345,7 +353,15 @@ def run_pipeline(
     while True:
         if max_frames and frame_idx >= max_frames:
             break
-        ok, frame = capture.read()
+        ok = capture.grab()
+        if not ok:
+            break
+        if frame_idx % FRAME_STRIDE != 0:
+            frame_idx += 1
+            if progress_cb and total:
+                progress_cb(frame_idx, total)
+            continue
+        ok, frame = capture.retrieve()
         if not ok:
             break
         t = frame_idx / fps
