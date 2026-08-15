@@ -15,14 +15,28 @@
 # motion specifically.
 #
 # Same occlusion tuning as courtiq_bytetrack.yaml (see that file for why):
-#   track_buffer: 30 -> 90
+#   track_buffer: 30 -> 90 (now further scaled per-video by fps, see
+#   scaled_tracker_config() in courtiq_core.py)
 #   new_track_thresh: 0.6 -> 0.7
+#
+# match_thresh: 0.8 -> 0.6. This is the actual per-frame IOU/cost
+# association gate -- how much bounding-box overlap between consecutive
+# frames is required to consider it the same player. Tripling track_buffer
+# (90 -> ~175 frames at measured ~58fps real footage) made zero measurable
+# difference to track fragmentation (25 tracks, identical down to the
+# sample count, before and after), which rules out "occlusion outlasts the
+# buffer" as the cause. That points at per-frame matching itself failing
+# even across very short gaps -- a defender crossing in front for one
+# frame, bounding-box jitter from a lower-accuracy nano model -- which
+# match_thresh (untouched until now) directly controls. 0.8 is strict;
+# loosening to 0.6 trades some risk of matching two different nearby
+# players for substantially fewer spurious new-track spawns.
 tracker_type: botsort
 track_high_thresh: 0.5
 track_low_thresh: 0.1
 new_track_thresh: 0.7
 track_buffer: 90
-match_thresh: 0.8
+match_thresh: 0.6
 fuse_score: True
 gmc_method: sparseOptFlow
 proximity_thresh: 0.5

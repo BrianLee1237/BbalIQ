@@ -18,10 +18,14 @@
 #                            one. Trade-off: a genuine substitution entering
 #                            the frame needs a slightly more confident
 #                            detection before getting its own track.
+#   match_thresh: 0.8 -> 0.6   Per-frame IOU/cost association gate. Loosened
+#                            after track_buffer alone proved to make zero
+#                            difference on real footage -- see
+#                            courtiq_botsort.yaml for the fuller writeup.
 tracker_type: bytetrack
 track_high_thresh: 0.5
 track_low_thresh: 0.1
 new_track_thresh: 0.7
 track_buffer: 90
-match_thresh: 0.8
+match_thresh: 0.6
 fuse_score: True
