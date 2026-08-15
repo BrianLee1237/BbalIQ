@@ -91,11 +91,15 @@ BALL_DETECT_CONF = float(os.environ.get("COURTIQ_BALL_CONF", os.environ.get("COU
 BALL_MODEL_PATH = os.environ.get("COURTIQ_BALL_MODEL", "yolo11n.pt")
 PLAYER_MODEL_PATH = os.environ.get("COURTIQ_PLAYER_MODEL", "yolo11n.pt")
 
-# Bundled, occlusion-tuned ByteTrack config (see courtiq_bytetrack.yaml for
-# what changed from ultralytics' default and why). Override with
-# COURTIQ_TRACKER_CONFIG to point at a different tracker yaml entirely.
+# Bundled BoT-SORT config with camera motion compensation (see
+# courtiq_botsort.yaml for what changed from ultralytics' defaults and
+# why -- real footage has enough camera pan/zoom that ByteTrack's
+# static-camera assumption fragments tracks regardless of tuning).
+# Override with COURTIQ_TRACKER_CONFIG to point at a different tracker
+# yaml entirely (courtiq_bytetrack.yaml is still bundled as an option for
+# genuinely static-camera footage, where it's cheaper to run).
 TRACKER_CONFIG = os.environ.get(
-    "COURTIQ_TRACKER_CONFIG", str(Path(__file__).resolve().parent / "courtiq_bytetrack.yaml")
+    "COURTIQ_TRACKER_CONFIG", str(Path(__file__).resolve().parent / "courtiq_botsort.yaml")
 )
 
 # Tracks shorter than this are dropped as noise (misdetections, motion-blur
@@ -453,25 +457,51 @@ def mean_jersey_color(frame, bbox):
     return crop.reshape(-1, 3).mean(axis=0)
 
 
-def assign_teams(track_colors: dict) -> dict:
-    """KMeans(k=2) over each track's mean jersey color -> {track_id: 0|1}."""
-    if not track_colors:
+MIN_COLOR_SAMPLES_FOR_FIT = int(os.environ.get("COURTIQ_MIN_COLOR_SAMPLES", "10"))
+
+
+def assign_teams(track_color_samples: dict) -> dict:
+    """KMeans(k=2) over jersey color -> {track_id: 0|1}.
+
+    track_color_samples maps track_id -> list of per-frame color samples
+    (not a pre-averaged single color). Only tracks with at least
+    MIN_COLOR_SAMPLES_FOR_FIT samples are used to *fit* the two cluster
+    centers -- a track that was only seen for a second or two has a noisy
+    mean color (motion blur, partial crops, lighting), and letting it
+    influence the cluster boundaries equally with a well-sampled, minutes
+    -long track skews both team assignments. Every track, including short
+    ones, still gets assigned to whichever fitted center is nearest.
+    """
+    if not track_color_samples:
         return {}
     if np is None:
         raise RuntimeError("numpy is required for team assignment.")
-    ids = list(track_colors.keys())
-    data = np.array([track_colors[i] for i in ids], dtype=np.float32)
-    if len(ids) < 2:
-        return {ids[0]: 0} if ids else {}
+
+    means = {tid: sum(colors) / len(colors) for tid, colors in track_color_samples.items() if colors}
+    if not means:
+        return {}
+
+    fit_ids = [tid for tid, colors in track_color_samples.items() if len(colors) >= MIN_COLOR_SAMPLES_FOR_FIT]
+    if len(fit_ids) < 2:
+        fit_ids = list(means.keys())  # not enough well-sampled tracks; fit on everything available
+    fit_data = np.array([means[tid] for tid in fit_ids], dtype=np.float32)
+
+    if len(fit_ids) < 2:
+        only_id = fit_ids[0] if fit_ids else next(iter(means))
+        return {only_id: 0}
+
     if cv2 is not None:
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
-        _, labels, _ = cv2.kmeans(data, 2, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
-        labels = labels.flatten().tolist()
+        _, fit_labels, centers = cv2.kmeans(fit_data, 2, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+        centers = [centers[0], centers[1]]
     else:
         # Minimal fallback so this module still degrades gracefully without cv2.kmeans.
-        centers = [data[0], data[-1]]
-        labels = [0 if np.linalg.norm(d - centers[0]) <= np.linalg.norm(d - centers[1]) else 1 for d in data]
-    return {track_id: int(label) for track_id, label in zip(ids, labels)}
+        centers = [fit_data[0], fit_data[-1]]
+
+    return {
+        tid: int(np.argmin([np.linalg.norm(mean - c) for c in centers]))
+        for tid, mean in means.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -622,9 +652,7 @@ def run_pipeline(
     track_first_seen = {tid: v for tid, v in track_first_seen.items() if tid in survivors}
     track_last_seen = {tid: v for tid, v in track_last_seen.items() if tid in survivors}
 
-    team_by_track = assign_teams({
-        track_id: sum(colors) / len(colors) for track_id, colors in track_colors.items() if colors
-    })
+    team_by_track = assign_teams(track_colors)
     for sample in player_samples:
         sample.team = team_by_track.get(sample.track_id)
 

@@ -1,0 +1,30 @@
+# BoT-SORT config for CourtIQ player tracking, replacing bytetrack as the
+# default. Real game footage (short, zoomed-in, hand-held/panning clips)
+# has significant camera motion between frames -- ByteTrack's matching
+# assumes a roughly static camera, so every bounding box shifts between
+# frames independent of actual player movement, breaking IOU-based
+# association regardless of tuning. Measured on real footage: 25
+# fragmented tracks for what should be ~10-12 real people in a 21-second
+# clip -- too short for that many to be legitimate substitutions.
+#
+# BoT-SORT adds global motion compensation (gmc_method: sparseOptFlow),
+# which estimates and corrects for camera ego-motion via optical flow
+# before matching detections between frames. with_reid stays off -- that
+# needs a separate appearance-embedding model this pipeline doesn't have;
+# GMC alone is independent of it and is the part that addresses camera
+# motion specifically.
+#
+# Same occlusion tuning as courtiq_bytetrack.yaml (see that file for why):
+#   track_buffer: 30 -> 90
+#   new_track_thresh: 0.6 -> 0.7
+tracker_type: botsort
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.7
+track_buffer: 90
+match_thresh: 0.8
+fuse_score: True
+gmc_method: sparseOptFlow
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: False
