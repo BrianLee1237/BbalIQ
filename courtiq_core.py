@@ -365,6 +365,16 @@ def detect_court_quad(frame) -> Optional[list]:
     This is a classical-CV heuristic, not a guarantee -- it can be wrong.
     See auto_homography() for how the result is used and what it falls
     back to when detection fails.
+
+    Color alone is not enough: measured on real footage, wooden bleachers
+    and warm gym-wall tones fall in the same broad hardwood color band as
+    the court floor, so a color-only mask picked almost the entire frame
+    (crowd, bleachers, scoreboard included) as "the court." Floor and
+    crowd look similar in color but very different in texture -- the
+    floor is visually smooth (sparse painted lines), the crowd is
+    visually busy (hundreds of edges from people/clothes/faces) -- so
+    this also requires low local edge density, which excludes the crowd
+    even where its color matches.
     """
     if cv2 is None or np is None:
         return None
@@ -374,7 +384,16 @@ def detect_court_quad(frame) -> Optional[list]:
     # dark/bright (avoids shadows and blown-out highlights).
     lower = np.array([5, 30, 80])
     upper = np.array([30, 200, 255])
-    mask = cv2.inRange(hsv, lower, upper)
+    color_mask = cv2.inRange(hsv, lower, upper)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    # Local edge density: fraction of edge pixels in each neighborhood.
+    # Low = smooth (floor); high = visually busy (crowd, bleachers, players).
+    edge_density = cv2.boxFilter(edges.astype(np.float32) / 255.0, -1, (31, 31))
+    smooth_mask = (edge_density < 0.12).astype(np.uint8) * 255
+
+    mask = cv2.bitwise_and(color_mask, smooth_mask)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
