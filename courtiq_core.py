@@ -386,50 +386,76 @@ def detect_court_quad(frame) -> Optional[list]:
     sideline (severing the connection) before dilating the main floor
     blob back to size.
     """
+    debug = court_quad_debug(frame)
+    return debug["quad"]
+
+
+# Tunable as module-level constants (not buried in the function) so they
+# can be adjusted and re-tested without hunting through the function body.
+COURT_HSV_LOWER = (5, 45, 80)
+COURT_HSV_UPPER = (30, 200, 255)
+COURT_EDGE_DENSITY_MAX = 0.08
+COURT_OPEN_KERNEL = 35
+COURT_MIN_AREA_FRACTION = 0.15
+
+
+def court_quad_debug(frame) -> dict:
+    """Same detection as detect_court_quad(), but returns every
+    intermediate mask and stat instead of just the final answer -- so
+    tuning the thresholds above can be based on actual numbers (mask
+    coverage %, contour area %) instead of guessing blind between runs.
+    See visualize_court.py for how this gets displayed.
+    """
+    result = {
+        "quad": None, "color_mask": None, "smooth_mask": None, "combined_mask": None,
+        "opened_mask": None, "color_coverage": 0.0, "smooth_coverage": 0.0,
+        "combined_coverage": 0.0, "largest_contour_fraction": 0.0, "reason": None,
+    }
     if cv2 is None or np is None:
-        return None
+        result["reason"] = "opencv/numpy not available"
+        return result
+
+    frame_area = frame.shape[0] * frame.shape[1]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # Broad band to tolerate lighting variation across gyms/arenas -- warm
-    # hardwood tones, not overly saturated (avoids team jerseys), not too
-    # dark/bright (avoids shadows and blown-out highlights). Raised the
-    # saturation floor from 30 to 45 to exclude low-saturation dark
-    # clothing (referee stripes, suits) that a lax floor let through.
-    lower = np.array([5, 45, 80])
-    upper = np.array([30, 200, 255])
-    color_mask = cv2.inRange(hsv, lower, upper)
+    color_mask = cv2.inRange(hsv, np.array(COURT_HSV_LOWER), np.array(COURT_HSV_UPPER))
+    result["color_mask"] = color_mask
+    result["color_coverage"] = float((color_mask > 0).sum()) / frame_area
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
-    # Local edge density: fraction of edge pixels in each neighborhood.
-    # Low = smooth (floor); high = visually busy (crowd, bleachers, players).
     edge_density = cv2.boxFilter(edges.astype(np.float32) / 255.0, -1, (31, 31))
-    smooth_mask = (edge_density < 0.08).astype(np.uint8) * 255
+    smooth_mask = (edge_density < COURT_EDGE_DENSITY_MAX).astype(np.uint8) * 255
+    result["smooth_mask"] = smooth_mask
+    result["smooth_coverage"] = float((smooth_mask > 0).sum()) / frame_area
 
     mask = cv2.bitwise_and(color_mask, smooth_mask)
+    result["combined_mask"] = mask
+    result["combined_coverage"] = float((mask > 0).sum()) / frame_area
+
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
-    # A large opening erodes away narrow bridges (a person standing at the
-    # court/sideline boundary) before dilating the main floor blob back to
-    # size -- a small kernel here isn't enough to sever those connections.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((35, 35), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((COURT_OPEN_KERNEL, COURT_OPEN_KERNEL), np.uint8))
+    result["opened_mask"] = mask
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None
+        result["reason"] = "no contours survived the opening step"
+        return result
     largest = max(contours, key=cv2.contourArea)
-    frame_area = frame.shape[0] * frame.shape[1]
-    if cv2.contourArea(largest) < 0.15 * frame_area:
-        return None  # too small to plausibly be the court floor
+    largest_fraction = cv2.contourArea(largest) / frame_area
+    result["largest_contour_fraction"] = largest_fraction
+    if largest_fraction < COURT_MIN_AREA_FRACTION:
+        result["reason"] = f"largest surviving contour is only {largest_fraction:.1%} of the frame (< {COURT_MIN_AREA_FRACTION:.0%} minimum)"
+        return result
 
     peri = cv2.arcLength(largest, True)
     approx = cv2.approxPolyDP(largest, 0.02 * peri, True)
     if len(approx) != 4:
-        # Contour outline isn't cleanly a quadrilateral (occlusion, odd
-        # floor markings) -- fall back to its minimum-area bounding
-        # rectangle, which is still a reasonable court-boundary estimate.
         rect = cv2.minAreaRect(largest)
         approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
     points = approx.reshape(-1, 2).astype(float)
-    return order_quad_points(points)
+    result["quad"] = order_quad_points(points)
+    return result
 
 
 def auto_homography(video_path: str) -> "np.ndarray":
