@@ -297,6 +297,109 @@ def default_full_frame_homography(width: int, height: int) -> "np.ndarray":
     return compute_homography(image_points, landmark_names)
 
 
+def order_quad_points(points) -> list:
+    """Order 4 arbitrary points as [top-left, top-right, bottom-right,
+    bottom-left] in image space, via the standard sum/difference trick
+    (top-left has the smallest x+y, bottom-right the largest; top-right
+    has the largest x-y, bottom-left the smallest).
+    """
+    pts = [tuple(p) for p in points]
+    sums = [p[0] + p[1] for p in pts]
+    diffs = [p[0] - p[1] for p in pts]
+    top_left = pts[sums.index(min(sums))]
+    bottom_right = pts[sums.index(max(sums))]
+    top_right = pts[diffs.index(max(diffs))]
+    bottom_left = pts[diffs.index(min(diffs))]
+    return [top_left, top_right, bottom_right, bottom_left]
+
+
+def detect_court_quad(frame) -> Optional[list]:
+    """Best-effort automatic detection of the visible court floor boundary
+    -- no manual clicking, no trained model, no downloaded weights. Finds
+    the largest contiguous region matching typical hardwood-court color
+    (warm tan/orange) and approximates its outline to 4 corners.
+
+    Returns [top-left, top-right, bottom-right, bottom-left] image points,
+    or None if no confident quadrilateral was found (unusual lighting, a
+    non-wood floor, or a view where the floor doesn't form a clean
+    quadrilateral -- e.g. heavily obstructed by players/crowd).
+
+    This is a classical-CV heuristic, not a guarantee -- it can be wrong.
+    See auto_homography() for how the result is used and what it falls
+    back to when detection fails.
+    """
+    if cv2 is None or np is None:
+        return None
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # Broad band to tolerate lighting variation across gyms/arenas -- warm
+    # hardwood tones, not overly saturated (avoids team jerseys), not too
+    # dark/bright (avoids shadows and blown-out highlights).
+    lower = np.array([5, 30, 80])
+    upper = np.array([30, 200, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    largest = max(contours, key=cv2.contourArea)
+    frame_area = frame.shape[0] * frame.shape[1]
+    if cv2.contourArea(largest) < 0.15 * frame_area:
+        return None  # too small to plausibly be the court floor
+
+    peri = cv2.arcLength(largest, True)
+    approx = cv2.approxPolyDP(largest, 0.02 * peri, True)
+    if len(approx) != 4:
+        # Contour outline isn't cleanly a quadrilateral (occlusion, odd
+        # floor markings) -- fall back to its minimum-area bounding
+        # rectangle, which is still a reasonable court-boundary estimate.
+        rect = cv2.minAreaRect(largest)
+        approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
+
+    points = approx.reshape(-1, 2).astype(float)
+    return order_quad_points(points)
+
+
+def auto_homography(video_path: str) -> "np.ndarray":
+    """Fully automatic homography -- no manual clicking. Tries
+    detect_court_quad() on the video's first frame; falls back to
+    default_full_frame_homography() if no confident court boundary was
+    found. This is the default for both the CLI and the web app. Pass
+    --interactive (CLI) for accurate manual calibration instead, which
+    will outperform this heuristic on angled or partial-court footage.
+    """
+    if cv2 is None:
+        raise RuntimeError("opencv-python is required for automatic homography.")
+    capture = cv2.VideoCapture(video_path)
+    ok, frame = capture.read()
+    capture.release()
+    if not ok:
+        raise RuntimeError(f"Could not read a frame from {video_path}.")
+    height, width = frame.shape[:2]
+
+    quad = detect_court_quad(frame)
+    if quad is None:
+        print(
+            "[courtiq_core] Automatic court-floor detection found no confident boundary; "
+            "falling back to a full-frame homography approximation. Pass --interactive "
+            "for accurate manual calibration."
+        )
+        return default_full_frame_homography(width, height)
+
+    print(
+        "[courtiq_core] Automatically detected a court floor boundary from color -- "
+        "using it for homography without manual clicking. This is a heuristic, not a "
+        "guarantee; pass --interactive if results look off."
+    )
+    # Assumes the detected floor region roughly spans a full-court view,
+    # with the near baseline at the bottom of the frame (closer to camera)
+    # and the far end (half-court line, in a full-court shot) at the top.
+    # That assumption is approximate for partial-court or heavily angled
+    # views -- same caveat as default_full_frame_homography().
+    landmark_names = ["halfcourt_left", "halfcourt_right", "baseline_right", "baseline_left"]
+    return compute_homography(quad, landmark_names)
+
+
 def project_point(homography: "np.ndarray", point) -> tuple:
     if np is None:
         raise RuntimeError("numpy is required to project points.")
@@ -893,26 +996,16 @@ def main():
     parser.add_argument(
         "--interactive", action="store_true",
         help="Click 4+ court landmarks on a paused frame for an accurate homography "
-             "(needs a display). Default is an automatic full-frame homography, which "
-             "is faster to run but only accurate for a straight-on full-court view.",
+             "(needs a display). Default is fully automatic (no clicking): tries "
+             "classical-CV court-floor detection first, falling back to a full-frame "
+             "guess if that fails. See auto_homography() for the accuracy trade-offs.",
     )
     args = parser.parse_args()
 
     if args.interactive:
         homography = pick_corners_interactive(args.video)
     else:
-        capture = cv2.VideoCapture(args.video)
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        capture.release()
-        if not width or not height:
-            raise RuntimeError(f"Could not read dimensions from {args.video}.")
-        print(
-            "Using an automatic full-frame homography (no landmark clicking). "
-            "This assumes a straight-on full-court view -- pass --interactive "
-            "for accurate calibration on angled or partial-court footage."
-        )
-        homography = default_full_frame_homography(width, height)
+        homography = auto_homography(args.video)
 
     data = analyze_video(
         args.video, homography,

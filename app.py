@@ -83,18 +83,17 @@ DECISION_TITLES = {
 }
 
 
-def default_homography(width: int, height: int):
-    """Best-effort fallback mapping the visible frame to a full court.
-
-    TODO: this assumes the uploaded clip is a straight-on full-court view,
-    which is rarely true for real broadcast/sideline footage. courtiq_core's
-    pick_corners_interactive() supports calibrating from any 4+ visible
-    landmarks (see COURT_LANDMARKS) and is the correct path for real
-    accuracy -- it just needs a click-based calibration step in the web UI,
-    which has not been built yet. Until then, court-position and possession
-    output from the web app should be treated as approximate.
+def default_homography(video_path: str):
+    """Fully automatic homography, no clicking required: courtiq_core tries
+    classical-CV court-floor detection first (color segmentation -> corner
+    quad), falling back to a full-frame guess if that fails. Both are
+    heuristics, not guaranteed-correct calibration -- see auto_homography()
+    in courtiq_core.py for the accuracy trade-offs. courtiq_core's
+    pick_corners_interactive() remains available for accurate manual
+    calibration but isn't wired into the web UI (no click-based
+    calibration step there yet).
     """
-    return courtiq_core.default_full_frame_homography(width, height)
+    return courtiq_core.auto_homography(video_path)
 
 
 def decisions_to_actions(data, interval=5.0):
@@ -154,7 +153,7 @@ def run_analysis_job(path: Path):
                 JOB["progress"] = done
                 JOB["total"] = total
 
-        homography = default_homography(width, height)
+        homography = default_homography(str(path))
         # Prefer a downloaded basketball-trained ball model (see
         # setup_ball_model.py) over the COCO fallback baked into
         # courtiq_core's default, if one has been set up.
