@@ -373,16 +373,28 @@ def detect_court_quad(frame) -> Optional[list]:
     crowd look similar in color but very different in texture -- the
     floor is visually smooth (sparse painted lines), the crowd is
     visually busy (hundreds of edges from people/clothes/faces) -- so
-    this also requires low local edge density, which excludes the crowd
-    even where its color matches.
+    this also requires low local edge density, which excludes most of the
+    crowd even where its color matches.
+
+    That alone still isn't enough where the sideline is directly
+    connected to the court with no color/texture break -- courtside
+    officials and bench players standing right at the boundary (measured
+    on real footage: still leaking in after the edge-density filter).
+    Their dark ref stripes/suits differ from hardwood in saturation, so a
+    saturation floor is added too, and a large morphological opening
+    erodes away the narrow "bridge" a standing person forms at the
+    sideline (severing the connection) before dilating the main floor
+    blob back to size.
     """
     if cv2 is None or np is None:
         return None
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     # Broad band to tolerate lighting variation across gyms/arenas -- warm
     # hardwood tones, not overly saturated (avoids team jerseys), not too
-    # dark/bright (avoids shadows and blown-out highlights).
-    lower = np.array([5, 30, 80])
+    # dark/bright (avoids shadows and blown-out highlights). Raised the
+    # saturation floor from 30 to 45 to exclude low-saturation dark
+    # clothing (referee stripes, suits) that a lax floor let through.
+    lower = np.array([5, 45, 80])
     upper = np.array([30, 200, 255])
     color_mask = cv2.inRange(hsv, lower, upper)
 
@@ -391,11 +403,14 @@ def detect_court_quad(frame) -> Optional[list]:
     # Local edge density: fraction of edge pixels in each neighborhood.
     # Low = smooth (floor); high = visually busy (crowd, bleachers, players).
     edge_density = cv2.boxFilter(edges.astype(np.float32) / 255.0, -1, (31, 31))
-    smooth_mask = (edge_density < 0.12).astype(np.uint8) * 255
+    smooth_mask = (edge_density < 0.08).astype(np.uint8) * 255
 
     mask = cv2.bitwise_and(color_mask, smooth_mask)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    # A large opening erodes away narrow bridges (a person standing at the
+    # court/sideline boundary) before dilating the main floor blob back to
+    # size -- a small kernel here isn't enough to sever those connections.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((35, 35), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
