@@ -4,7 +4,7 @@ import courtiq_core as c
 
 video_path = sys.argv[1] if len(sys.argv) > 1 else "game.mov"
 conf = float(sys.argv[2]) if len(sys.argv) > 2 else 0.1
-num_frames = 60
+num_frames = int(sys.argv[3]) if len(sys.argv) > 3 else 1400  # covers the whole ~21s clip at ~58fps
 
 H = c.keypoint_model_homography(video_path, "models/court_keypoints.pt", conf_threshold=conf)
 ball_model = c._load_model("models/basketball_ball.pt")
@@ -12,8 +12,10 @@ ball_class = c.resolve_ball_class(ball_model)
 print(f"ball_class index: {ball_class}")
 
 capture = cv2.VideoCapture(video_path)
+fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
 on_court_count = 0
 total_count = 0
+off_court_frames = []
 for i in range(num_frames):
     ok, frame = capture.read()
     if not ok:
@@ -28,7 +30,12 @@ for i in range(num_frames):
     on_court = c.is_on_court(x_ft, y_ft)
     total_count += 1
     on_court_count += on_court
-    print(f"frame {i}: ball_px=({center[0]:.0f},{center[1]:.0f}) -> court_ft=({x_ft:.1f},{y_ft:.1f}) on_court={on_court}")
+    if not on_court:
+        off_court_frames.append((i, i / fps, x_ft, y_ft))
 capture.release()
 
 print(f"\n{on_court_count}/{total_count} ball detections landed on-court ({on_court_count/total_count:.1%})" if total_count else "No ball detections found in these frames.")
+if off_court_frames:
+    print(f"\n{len(off_court_frames)} off-court detections. First 10 and last 10:")
+    for i, t, x_ft, y_ft in off_court_frames[:10] + (off_court_frames[-10:] if len(off_court_frames) > 10 else []):
+        print(f"  frame {i} (t={t:.1f}s): court_ft=({x_ft:.1f},{y_ft:.1f})")
