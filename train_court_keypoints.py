@@ -5,14 +5,15 @@ project reloc2-den7l), since that repo's own trained weights are not
 publicly accessible (confirmed dead Google Drive link, unanswered GitHub
 issue asking the same question since September).
 
-Deliberately scaled down from that repo's own training config
-(yolov8x-pose.pt for 500 epochs) to something realistic on a MacBook Air
-with no dedicated NVIDIA GPU -- yolov8n-pose.pt (nano, far fewer
-parameters) for far fewer epochs. This trades some accuracy for actually
-finishing in a reasonable time on Apple Silicon (PyTorch's MPS backend,
-not CUDA). Expect this to still take a while -- keep the laptop plugged
-in. If results aren't accurate enough, EPOCHS/MODEL below are the first
-things to increase, at the cost of training time.
+UPDATED to match that repo's exact training config (yolov8x-pose.pt,
+500 epochs, batch 16) after a first pass with a scaled-down config
+(yolov8n-pose, 100 epochs) produced a homography where only 10/18
+keypoints were usable as RANSAC inliers -- degraded accuracy on the
+far/smaller keypoints, consistent with that scale-down trade-off. This
+exact config has NOT been scaled down for hardware without a dedicated
+NVIDIA GPU: on Apple Silicon (PyTorch's MPS backend, not CUDA) this can
+realistically take multiple days. Keep the laptop plugged in and
+uninterrupted for the whole run.
 
 Usage:
     export ROBOFLOW_API_KEY="your key here"   # never hardcode it in this file
@@ -24,10 +25,19 @@ import os
 import sys
 from pathlib import Path
 
-MODEL = "yolov8n-pose.pt"  # nano -- far smaller/faster than the repo's yolov8x-pose.pt
-EPOCHS = 100                # scaled down from the repo's 500
+MODEL = "yolov8x-pose.pt"  # extra-large -- matches the source repo's exact config
+EPOCHS = 500                # matches the source repo's exact config
 IMGSZ = 640
-BATCH = 8                   # smaller batch than their 16, more forgiving on limited memory
+BATCH = 16                  # matches the source repo's exact config
+# WARNING: this is the repo's literal training config, not scaled down for
+# hardware without a dedicated NVIDIA GPU. On a MacBook Air (Apple
+# Silicon MPS backend, not CUDA) this can realistically take MULTIPLE
+# DAYS, not hours -- the nano/100-epoch run that produced the first
+# court_keypoints.pt (10/18 keypoints usable as RANSAC inliers, degraded
+# far-keypoint accuracy) was far cheaper than this. Keep the laptop
+# plugged in and uninterrupted for the whole run. If this isn't
+# practical, yolov8s-pose.pt with EPOCHS=250 is a meaningfully cheaper
+# middle ground.
 
 ROOT = Path(__file__).resolve().parent
 OUT_MODEL = ROOT / "models" / "court_keypoints.pt"
