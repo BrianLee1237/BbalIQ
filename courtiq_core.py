@@ -1359,10 +1359,17 @@ def main():
              "detection when set. UNVALIDATED against real footage -- verify the "
              "detection rate/accuracy yourself before trusting it.",
     )
+    parser.add_argument(
+        "--keypoint-conf", type=float, default=KEYPOINT_MODEL_CONF_THRESHOLD,
+        help=f"Confidence threshold for --keypoint-model (default {KEYPOINT_MODEL_CONF_THRESHOLD}). "
+             "A freshly-trained model's confidence calibration can be very different from "
+             "whatever default this was set from -- check debug_keypoints.py's raw output "
+             "and lower this if real detections are being filtered out.",
+    )
     args = parser.parse_args()
 
     if args.keypoint_model:
-        homography = keypoint_model_homography(args.video, args.keypoint_model)
+        homography = keypoint_model_homography(args.video, args.keypoint_model, conf_threshold=args.keypoint_conf)
     elif args.interactive:
         homography = pick_corners_interactive(args.video)
     else:
