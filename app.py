@@ -154,12 +154,17 @@ def run_analysis_job(path: Path):
                 JOB["total"] = total
 
         homography = default_homography(str(path))
-        # Prefer a downloaded basketball-trained ball model (see
-        # setup_ball_model.py) over the COCO fallback baked into
-        # courtiq_core's default, if one has been set up.
+        # Prefer downloaded/trained basketball-specific models over the
+        # COCO fallbacks baked into courtiq_core's defaults, if set up.
         basketball_ball_model = ROOT / "models" / "basketball_ball.pt"
         ball_model_path = str(basketball_ball_model) if basketball_ball_model.exists() else courtiq_core.BALL_MODEL_PATH
-        data = courtiq_core.analyze_video(str(path), homography, ball_model_path=ball_model_path, progress_cb=progress_cb)
+        basketball_player_model = ROOT / "models" / "basketball_players.pt"
+        player_model_path = str(basketball_player_model) if basketball_player_model.exists() else courtiq_core.PLAYER_MODEL_PATH
+        data = courtiq_core.analyze_video(
+            str(path), homography,
+            ball_model_path=ball_model_path, player_model_path=player_model_path,
+            progress_cb=progress_cb,
+        )
         actions = decisions_to_actions(data)
         tracks_path = path.with_suffix(".tracks.json")
         tracks_path.write_text(json.dumps(courtiq_core.to_json_dict(data), indent=2))

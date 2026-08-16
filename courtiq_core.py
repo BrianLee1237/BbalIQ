@@ -77,7 +77,8 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-PERSON_CLASS = 0
+PERSON_CLASS_FALLBACK = 0  # COCO "person" index, used only if a model's
+                            # class names don't contain a person-like name below.
 BALL_CLASS_FALLBACK = 32  # COCO "sports ball" index, used only if a model's
                            # class names don't contain a ball-like name below.
 # Basketball-trained models (e.g. Roboflow Universe exports, or
@@ -86,6 +87,13 @@ BALL_CLASS_FALLBACK = 32  # COCO "sports ball" index, used only if a model's
 # resolve_ball_class() below looks the class index up by name so swapping
 # BALL_MODEL_PATH doesn't also require guessing a new hardcoded index.
 BALL_CLASS_NAMES = {"ball", "basketball", "sports ball"}
+# Same idea for the player detector -- a basketball-specific dataset (e.g.
+# universe.roboflow.com/workspace-5ujvu/basketball-players-fy4c2-vfsuv)
+# names its player class "Player" at whatever index its training data
+# used, not COCO's "person" at index 0. This also lets that dataset's
+# separate "Ref" class stay excluded automatically, since we only match
+# person-like names, not referee-like ones.
+PERSON_CLASS_NAMES = {"person", "player"}
 
 # Separate confidence thresholds for player vs. ball detection -- they were
 # previously shared (COURTIQ_DETECT_CONF), but a low threshold that's
@@ -795,6 +803,23 @@ def resolve_ball_class(model) -> int:
     return BALL_CLASS_FALLBACK
 
 
+def resolve_person_class(model) -> int:
+    """Find the player/person class index by name rather than assuming
+    COCO's index 0. A basketball-specific player dataset typically names
+    its class "Player" (and may have a separate "Ref" class, which this
+    deliberately does NOT match, so referees stay excluded). An explicit
+    COURTIQ_PERSON_CLASS env var always wins if set.
+    """
+    override = os.environ.get("COURTIQ_PERSON_CLASS")
+    if override is not None:
+        return int(override)
+    names = getattr(model, "names", None) or {}
+    for idx, name in names.items():
+        if str(name).strip().lower() in PERSON_CLASS_NAMES:
+            return int(idx)
+    return PERSON_CLASS_FALLBACK
+
+
 def run_pipeline(
     video_path: str,
     homography: "np.ndarray",
@@ -815,6 +840,7 @@ def run_pipeline(
     player_model = _load_model(player_model_path)
     ball_model = player_model if ball_model_path == player_model_path else _load_model(ball_model_path)
     ball_class = resolve_ball_class(ball_model)
+    person_class = resolve_person_class(player_model)
 
     capture = cv2.VideoCapture(video_path)
     if not capture.isOpened():
@@ -851,7 +877,7 @@ def run_pipeline(
 
         # Player detection + tracking (ByteTrack keeps IDs stable across frames).
         track_result = player_model.track(
-            frame, classes=[PERSON_CLASS], conf=PLAYER_DETECT_CONF, tracker=tracker_config,
+            frame, classes=[person_class], conf=PLAYER_DETECT_CONF, tracker=tracker_config,
             persist=True, verbose=False,
         )[0]
 
