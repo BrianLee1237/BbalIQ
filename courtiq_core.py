@@ -623,6 +623,11 @@ KEYPOINT_MODEL_COURT_POINTS_FT = [
     (16.99, 72.87), (32.81, 72.87),
 ]
 KEYPOINT_MODEL_CONF_THRESHOLD = 0.6
+# Reject the computed homography outright if its average reprojection
+# error (in court feet, over the RANSAC inlier keypoints) exceeds this --
+# better to fail loudly than silently hand back a badly warped homography
+# that quietly corrupts every downstream position.
+KEYPOINT_MODEL_REPROJ_ERROR_MAX_FT = 5.0
 
 
 def keypoint_model_homography(video_path: str, model_path: str, conf_threshold: float = KEYPOINT_MODEL_CONF_THRESHOLD) -> "np.ndarray":
@@ -666,10 +671,49 @@ def keypoint_model_homography(video_path: str, model_path: str, conf_threshold: 
 
     src = np.array(image_points, dtype=np.float32)
     dst = np.array(court_points, dtype=np.float32)
-    homography, _ = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+    homography, mask = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
     if homography is None:
         raise RuntimeError("cv2.findHomography could not compute a homography from the detected keypoints.")
+
+    homography = fix_homography_flip(homography)
+
+    inlier_mask = mask.ravel().astype(bool) if mask is not None else np.ones(len(src), dtype=bool)
+    error = reprojection_error(homography, src[inlier_mask], dst[inlier_mask])
+    print(f"[courtiq_core] Keypoint homography reprojection error: {error:.2f} ft "
+          f"({int(inlier_mask.sum())}/{len(src)} keypoints used as RANSAC inliers)")
+    if error > KEYPOINT_MODEL_REPROJ_ERROR_MAX_FT:
+        raise RuntimeError(
+            f"Reprojection error {error:.1f} ft exceeds the {KEYPOINT_MODEL_REPROJ_ERROR_MAX_FT} ft "
+            f"sanity threshold -- this homography is not trustworthy. Try a different frame, "
+            f"a lower/higher --keypoint-conf, or fall back to --interactive."
+        )
     return homography
+
+
+def fix_homography_flip(homography: "np.ndarray") -> "np.ndarray":
+    """Detect and correct a horizontal flip in the homography's
+    rotation/scaling block (checked via its determinant sign). Ported from
+    tactical_view/homography.py in the source repo -- point-correspondence
+    homographies can come out mirrored under some point configurations,
+    and this was silently missing from the first version of this function.
+    """
+    rotation_scale = homography[:2, :2]
+    if np.linalg.det(rotation_scale) < 0:
+        homography = homography.copy()
+        homography[:, 0] *= -1
+    return homography
+
+
+def reprojection_error(homography: "np.ndarray", image_points, court_points) -> float:
+    """Mean distance (in court feet) between where image_points actually
+    land after projection and where court_points says they should be --
+    a direct measure of how good the fitted homography actually is,
+    instead of trusting whatever cv2.findHomography returns unchecked.
+    """
+    img_pts = np.array(image_points, dtype=np.float32).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(img_pts, homography).reshape(-1, 2)
+    court_pts = np.array(court_points, dtype=np.float32)
+    return float(np.mean(np.linalg.norm(projected - court_pts, axis=1)))
 
 
 def project_point(homography: "np.ndarray", point) -> tuple:
