@@ -29,7 +29,7 @@ from pathlib import Path
 
 WORKSPACE = "workspace-5ujvu"
 PROJECT = "basketball-players-fy4c2-vfsuv"
-VERSION = 1
+VERSION = 17  # latest available version, confirmed via project.versions() -- 1 doesn't exist for this project
 
 MODEL = "yolov8n.pt"  # nano detection model
 EPOCHS = 100
