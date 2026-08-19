@@ -690,6 +690,106 @@ def keypoint_model_homography(video_path: str, model_path: str, conf_threshold: 
     return homography
 
 
+# The four real-world corners of the court, in this file's feet convention
+# (see KEYPOINT_MODEL_COURT_POINTS_FT) -- used by hybrid_homography() to
+# match classical-CV floor-boundary corners to the nearest true court
+# corner by projected position, not by assumed image position (near/far,
+# top/bottom). That's what lets this work for a diagonally-framed court:
+# nothing here assumes any particular orientation in the image.
+TRUE_COURT_CORNERS_FT = [(0.0, 0.0), (COURT_WIDTH_FT, 0.0), (COURT_WIDTH_FT, COURT_LENGTH_FT), (0.0, COURT_LENGTH_FT)]
+HYBRID_LENIENT_CONF = 0.05          # use nearly every keypoint the model produced; RANSAC sorts good from bad
+HYBRID_CORNER_MATCH_MAX_FT = 15.0   # a classical-CV corner projecting farther than this from every true
+                                     # corner isn't trustworthy enough to add as a supplemental point
+
+
+def hybrid_homography(video_path: str, keypoint_model_path: str, lenient_conf: float = HYBRID_LENIENT_CONF) -> "np.ndarray":
+    """Combines the trained keypoint model (better at far/small landmarks,
+    even at lower confidence, per visual inspection on real footage --
+    it's finding the right general area, just not confidently) with
+    detect_court_quad()'s classical-CV floor-boundary detection (better at
+    the near/close part of the court, where it's not fighting
+    crowd/occlusion or scale the way the trained model was) instead of
+    relying on either alone.
+
+    Two-pass approach, deliberately NOT assuming any fixed image
+    layout (so a diagonally-framed court still works):
+      1. Fit a rough homography from the keypoint model's detections alone.
+      2. Use THAT rough homography to project detect_court_quad()'s 4
+         floor-boundary corners into real-world court coordinates, then
+         match each one to whichever of the 4 TRUE court corners it landed
+         closest to. This correspondence is found by projected position,
+         not raw image position (top/bottom, left/right) -- a diagonal
+         court works the same as an axis-aligned one here.
+      3. Add those matched corners as extra correspondence points and
+         refit. The classical corners tend to be more confidently placed
+         at the boundary than the trained model alone, which should pull
+         the final homography's accuracy up specifically at the edges --
+         exactly where the keypoint-model-only version was weakest.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    model = _load_model(keypoint_model_path)
+    capture = cv2.VideoCapture(video_path)
+    ok, frame = capture.read()
+    capture.release()
+    if not ok:
+        raise RuntimeError(f"Could not read a frame from {video_path}.")
+
+    result = model(frame, verbose=False)[0]
+    if result.keypoints is None:
+        raise RuntimeError("The model produced no keypoints -- confirm keypoint_model_path is correct.")
+    xy = result.keypoints.xy[0].tolist()
+    conf = result.keypoints.conf[0].tolist() if result.keypoints.conf is not None else [1.0] * len(xy)
+    if len(xy) != len(KEYPOINT_MODEL_COURT_POINTS_FT):
+        raise RuntimeError(f"Model produced {len(xy)} keypoints, expected {len(KEYPOINT_MODEL_COURT_POINTS_FT)}.")
+
+    image_points = [pt for pt, c in zip(xy, conf) if c >= lenient_conf]
+    court_points = [pt for pt, c in zip(KEYPOINT_MODEL_COURT_POINTS_FT, conf) if c >= lenient_conf]
+    if len(image_points) < 4:
+        raise RuntimeError(f"Only {len(image_points)} keypoints passed lenient_conf={lenient_conf} (need >= 4).")
+
+    src = np.array(image_points, dtype=np.float32)
+    dst = np.array(court_points, dtype=np.float32)
+    H1, _ = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+    if H1 is None:
+        raise RuntimeError("cv2.findHomography could not compute even a rough homography from the keypoint model.")
+    H1 = fix_homography_flip(H1)
+
+    quad = detect_court_quad(frame)
+    extra_src, extra_dst = [], []
+    if quad is not None:
+        for image_pt in quad:
+            rough_x_ft, rough_y_ft = project_point(H1, image_pt)
+            distances = [math.hypot(rough_x_ft - cx, rough_y_ft - cy) for cx, cy in TRUE_COURT_CORNERS_FT]
+            best_idx = distances.index(min(distances))
+            if distances[best_idx] <= HYBRID_CORNER_MATCH_MAX_FT:
+                extra_src.append(image_pt)
+                extra_dst.append(TRUE_COURT_CORNERS_FT[best_idx])
+        print(f"[courtiq_core] Hybrid: matched {len(extra_src)}/4 classical-CV floor corners to true court corners.")
+    else:
+        print("[courtiq_core] Hybrid: classical-CV floor detection found nothing to supplement with; using keypoint model alone.")
+
+    combined_src = image_points + extra_src
+    combined_dst = court_points + extra_dst
+    src2 = np.array(combined_src, dtype=np.float32)
+    dst2 = np.array(combined_dst, dtype=np.float32)
+    H2, mask2 = cv2.findHomography(src2, dst2, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+    if H2 is None:
+        print("[courtiq_core] Hybrid: combined fit failed, falling back to keypoint-model-only homography.")
+        return H1
+    H2 = fix_homography_flip(H2)
+
+    inlier_mask = mask2.ravel().astype(bool) if mask2 is not None else np.ones(len(src2), dtype=bool)
+    error = reprojection_error(H2, src2[inlier_mask], dst2[inlier_mask])
+    print(f"[courtiq_core] Hybrid homography reprojection error: {error:.2f} ft "
+          f"({int(inlier_mask.sum())}/{len(src2)} points used as RANSAC inliers)")
+    if error > KEYPOINT_MODEL_REPROJ_ERROR_MAX_FT:
+        print(f"[courtiq_core] Hybrid: combined error {error:.1f} ft exceeds sanity threshold, "
+              f"falling back to keypoint-model-only homography.")
+        return H1
+    return H2
+
+
 def fix_homography_flip(homography: "np.ndarray") -> "np.ndarray":
     """Detect and correct a horizontal flip in the homography's
     rotation/scaling block (checked via its determinant sign). Ported from
@@ -1410,9 +1510,19 @@ def main():
              "whatever default this was set from -- check debug_keypoints.py's raw output "
              "and lower this if real detections are being filtered out.",
     )
+    parser.add_argument(
+        "--hybrid-model", default=None,
+        help="Path to a trained court-keypoint model, used in HYBRID mode: the keypoint "
+             "model handles far/small landmarks (even at low confidence -- it's finding "
+             "the right area, just not confidently), and detect_court_quad()'s classical-CV "
+             "floor detection supplements the near/close corners. See hybrid_homography(). "
+             "Takes priority over --keypoint-model/--interactive/automatic when set.",
+    )
     args = parser.parse_args()
 
-    if args.keypoint_model:
+    if args.hybrid_model:
+        homography = hybrid_homography(args.video, args.hybrid_model)
+    elif args.keypoint_model:
         homography = keypoint_model_homography(args.video, args.keypoint_model, conf_threshold=args.keypoint_conf)
     elif args.interactive:
         homography = pick_corners_interactive(args.video)
