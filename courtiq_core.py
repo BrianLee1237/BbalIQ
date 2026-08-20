@@ -646,10 +646,11 @@ def keypoint_model_homography(video_path: str, model_path: str, conf_threshold: 
         raise RuntimeError(f"Could not read a frame from {video_path}.")
 
     result = model(frame, verbose=False)[0]
-    if result.keypoints is None:
+    if result.keypoints is None or len(result.keypoints.xy) == 0:
         raise RuntimeError(
-            "The model produced no keypoints -- confirm model_path is actually the "
-            "court-keypoint model, not the player or ball detector."
+            "The model detected no instance in this frame at all -- confirm model_path is "
+            "actually the court-keypoint model, not the player or ball detector, or try a "
+            "different frame."
         )
     xy = result.keypoints.xy[0].tolist()
     conf = result.keypoints.conf[0].tolist() if result.keypoints.conf is not None else [1.0] * len(xy)
@@ -753,7 +754,7 @@ def hybrid_homography_for_frame(frame, model, lenient_conf: float = HYBRID_LENIE
     keypoints, or findHomography failed outright).
     """
     result = model(frame, verbose=False)[0]
-    if result.keypoints is None:
+    if result.keypoints is None or len(result.keypoints.xy) == 0:
         return None
     xy = result.keypoints.xy[0].tolist()
     conf = result.keypoints.conf[0].tolist() if result.keypoints.conf is not None else [1.0] * len(xy)
