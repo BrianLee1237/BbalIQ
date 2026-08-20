@@ -768,10 +768,17 @@ def hybrid_homography_for_frame(frame, model, lenient_conf: float = HYBRID_LENIE
 
     src = np.array(image_points, dtype=np.float32)
     dst = np.array(court_points, dtype=np.float32)
-    H1, _ = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+    H1, mask1_raw = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
     if H1 is None:
         return None
     H1 = fix_homography_flip(H1)
+    # Real RANSAC inlier mask, NOT a fabricated all-ones one -- using a fake
+    # mask here previously caused a frame with a genuinely bad fit (127ft
+    # reprojection error) to be reported as "18/18 inliers," which won the
+    # multi-frame search's inlier-count comparison despite being garbage.
+    mask1 = mask1_raw.ravel().astype(bool) if mask1_raw is not None else np.ones(len(src), dtype=bool)
+    if not mask1.any():
+        return None
 
     quad = detect_court_quad(frame)
     extra_src, extra_dst = [], []
@@ -790,15 +797,14 @@ def hybrid_homography_for_frame(frame, model, lenient_conf: float = HYBRID_LENIE
     dst2 = np.array(combined_dst, dtype=np.float32)
     H2, mask2 = cv2.findHomography(src2, dst2, method=cv2.RANSAC, ransacReprojThreshold=5.0)
     if H2 is None:
-        inlier_mask = np.ones(len(src), dtype=bool)
-        error = reprojection_error(H1, src[inlier_mask], dst[inlier_mask])
-        return H1, int(inlier_mask.sum()), len(src), error
+        error1 = reprojection_error(H1, src[mask1], dst[mask1])
+        return H1, int(mask1.sum()), len(src), error1
     H2 = fix_homography_flip(H2)
 
     inlier_mask = mask2.ravel().astype(bool) if mask2 is not None else np.ones(len(src2), dtype=bool)
     error = reprojection_error(H2, src2[inlier_mask], dst2[inlier_mask])
     if error > KEYPOINT_MODEL_REPROJ_ERROR_MAX_FT:
-        inlier_mask1 = np.ones(len(src), dtype=bool)
+        inlier_mask1 = mask1
         error1 = reprojection_error(H1, src[inlier_mask1], dst[inlier_mask1])
         return H1, int(inlier_mask1.sum()), len(src), error1
     return H2, int(inlier_mask.sum()), len(src2), error
