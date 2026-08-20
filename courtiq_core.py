@@ -735,24 +735,41 @@ def hybrid_homography(video_path: str, keypoint_model_path: str, lenient_conf: f
     if not ok:
         raise RuntimeError(f"Could not read a frame from {video_path}.")
 
+    result = hybrid_homography_for_frame(frame, model, lenient_conf)
+    if result is None:
+        raise RuntimeError("Could not compute a homography from this frame -- see printed diagnostics above.")
+    homography, inliers, total, error = result
+    print(f"[courtiq_core] Hybrid homography reprojection error: {error:.2f} ft ({inliers}/{total} points used as RANSAC inliers)")
+    return homography
+
+
+def hybrid_homography_for_frame(frame, model, lenient_conf: float = HYBRID_LENIENT_CONF):
+    """Core logic factored out of hybrid_homography() so it can run against
+    any single frame array, not just video_path's frame 0 -- used both by
+    hybrid_homography() itself and by best_hybrid_homography()'s
+    multi-frame search below. Returns (homography, inlier_count,
+    total_point_count, reprojection_error_ft), or None if this frame
+    couldn't produce a usable homography at all (too few confident
+    keypoints, or findHomography failed outright).
+    """
     result = model(frame, verbose=False)[0]
     if result.keypoints is None:
-        raise RuntimeError("The model produced no keypoints -- confirm keypoint_model_path is correct.")
+        return None
     xy = result.keypoints.xy[0].tolist()
     conf = result.keypoints.conf[0].tolist() if result.keypoints.conf is not None else [1.0] * len(xy)
     if len(xy) != len(KEYPOINT_MODEL_COURT_POINTS_FT):
-        raise RuntimeError(f"Model produced {len(xy)} keypoints, expected {len(KEYPOINT_MODEL_COURT_POINTS_FT)}.")
+        return None
 
     image_points = [pt for pt, c in zip(xy, conf) if c >= lenient_conf]
     court_points = [pt for pt, c in zip(KEYPOINT_MODEL_COURT_POINTS_FT, conf) if c >= lenient_conf]
     if len(image_points) < 4:
-        raise RuntimeError(f"Only {len(image_points)} keypoints passed lenient_conf={lenient_conf} (need >= 4).")
+        return None
 
     src = np.array(image_points, dtype=np.float32)
     dst = np.array(court_points, dtype=np.float32)
     H1, _ = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
     if H1 is None:
-        raise RuntimeError("cv2.findHomography could not compute even a rough homography from the keypoint model.")
+        return None
     H1 = fix_homography_flip(H1)
 
     quad = detect_court_quad(frame)
@@ -765,9 +782,6 @@ def hybrid_homography(video_path: str, keypoint_model_path: str, lenient_conf: f
             if distances[best_idx] <= HYBRID_CORNER_MATCH_MAX_FT:
                 extra_src.append(image_pt)
                 extra_dst.append(TRUE_COURT_CORNERS_FT[best_idx])
-        print(f"[courtiq_core] Hybrid: matched {len(extra_src)}/4 classical-CV floor corners to true court corners.")
-    else:
-        print("[courtiq_core] Hybrid: classical-CV floor detection found nothing to supplement with; using keypoint model alone.")
 
     combined_src = image_points + extra_src
     combined_dst = court_points + extra_dst
@@ -775,19 +789,70 @@ def hybrid_homography(video_path: str, keypoint_model_path: str, lenient_conf: f
     dst2 = np.array(combined_dst, dtype=np.float32)
     H2, mask2 = cv2.findHomography(src2, dst2, method=cv2.RANSAC, ransacReprojThreshold=5.0)
     if H2 is None:
-        print("[courtiq_core] Hybrid: combined fit failed, falling back to keypoint-model-only homography.")
-        return H1
+        inlier_mask = np.ones(len(src), dtype=bool)
+        error = reprojection_error(H1, src[inlier_mask], dst[inlier_mask])
+        return H1, int(inlier_mask.sum()), len(src), error
     H2 = fix_homography_flip(H2)
 
     inlier_mask = mask2.ravel().astype(bool) if mask2 is not None else np.ones(len(src2), dtype=bool)
     error = reprojection_error(H2, src2[inlier_mask], dst2[inlier_mask])
-    print(f"[courtiq_core] Hybrid homography reprojection error: {error:.2f} ft "
-          f"({int(inlier_mask.sum())}/{len(src2)} points used as RANSAC inliers)")
     if error > KEYPOINT_MODEL_REPROJ_ERROR_MAX_FT:
-        print(f"[courtiq_core] Hybrid: combined error {error:.1f} ft exceeds sanity threshold, "
-              f"falling back to keypoint-model-only homography.")
-        return H1
-    return H2
+        inlier_mask1 = np.ones(len(src), dtype=bool)
+        error1 = reprojection_error(H1, src[inlier_mask1], dst[inlier_mask1])
+        return H1, int(inlier_mask1.sum()), len(src), error1
+    return H2, int(inlier_mask.sum()), len(src2), error
+
+
+BEST_FRAME_CANDIDATE_COUNT = 20  # how many frames to sample when searching for the best calibration frame
+
+
+def best_hybrid_homography(video_path: str, keypoint_model_path: str, lenient_conf: float = HYBRID_LENIENT_CONF,
+                            num_candidates: int = BEST_FRAME_CANDIDATE_COUNT) -> "np.ndarray":
+    """Calibrating off frame 0 alone assumes that specific frame happens to
+    have clear sightlines to every landmark -- there's no reason to expect
+    that (players/refs can be standing right on top of a far keypoint in
+    any given frame). This scans num_candidates frames spread across the
+    video instead, scores each with hybrid_homography_for_frame() (more
+    RANSAC inliers, and among ties lower reprojection error, wins), and
+    returns whichever homography actually fit best -- using the same
+    diagnostic numbers already being computed, just to choose instead of
+    only to report.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    model = _load_model(keypoint_model_path)
+    capture = cv2.VideoCapture(video_path)
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if frame_count <= 0:
+        capture.release()
+        raise RuntimeError(f"Could not read frame count from {video_path}.")
+
+    sample_indices = sorted(set(int(i * frame_count / num_candidates) for i in range(num_candidates)))
+    best = None  # (inliers, -error, homography, frame_idx, total)
+    for idx in sample_indices:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = capture.read()
+        if not ok:
+            continue
+        result = hybrid_homography_for_frame(frame, model, lenient_conf)
+        if result is None:
+            continue
+        homography, inliers, total, error = result
+        score = (inliers, -error)
+        if best is None or score > best[0]:
+            best = (score, homography, idx, inliers, total, error)
+    capture.release()
+
+    if best is None:
+        raise RuntimeError(
+            f"None of the {len(sample_indices)} sampled frames produced a usable homography -- "
+            f"try a lower lenient_conf, more candidate frames, or --interactive."
+        )
+    _, homography, frame_idx, inliers, total, error = best
+    print(f"[courtiq_core] Best calibration frame: {frame_idx}/{frame_count} "
+          f"(reprojection error {error:.2f} ft, {inliers}/{total} points used as RANSAC inliers, "
+          f"out of {len(sample_indices)} candidates tried)")
+    return homography
 
 
 def fix_homography_flip(homography: "np.ndarray") -> "np.ndarray":
@@ -1518,9 +1583,20 @@ def main():
              "floor detection supplements the near/close corners. See hybrid_homography(). "
              "Takes priority over --keypoint-model/--interactive/automatic when set.",
     )
+    parser.add_argument(
+        "--best-frame-model", default=None,
+        help="Path to a trained court-keypoint model. Same hybrid approach as --hybrid-model, "
+             "but scans multiple frames across the video (see BEST_FRAME_CANDIDATE_COUNT) and "
+             "picks whichever one actually fits best, instead of assuming frame 0 is good. "
+             "Slower (runs detection on several frames up front) but doesn't depend on frame 0 "
+             "happening to have clear sightlines to every landmark. Takes priority over "
+             "--hybrid-model/--keypoint-model/--interactive/automatic when set.",
+    )
     args = parser.parse_args()
 
-    if args.hybrid_model:
+    if args.best_frame_model:
+        homography = best_hybrid_homography(args.video, args.best_frame_model)
+    elif args.hybrid_model:
         homography = hybrid_homography(args.video, args.hybrid_model)
     elif args.keypoint_model:
         homography = keypoint_model_homography(args.video, args.keypoint_model, conf_threshold=args.keypoint_conf)
