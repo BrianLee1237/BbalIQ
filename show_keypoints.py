@@ -3,7 +3,7 @@ homography, no on-court filtering, just what the model itself sees.
 Each point is numbered (0-17, matching KEYPOINT_MODEL_COURT_POINTS_FT's
 order) and colored by confidence: green >= 0.5, yellow >= 0.25, red below.
 
-Usage: python3 show_keypoints.py <video> [frame_number]
+Usage: python3 show_keypoints.py <video> [frame_number] [conf_threshold]
 Output: keypoint_detection.png
 """
 import sys
@@ -12,6 +12,7 @@ from ultralytics import YOLO
 
 video_path = sys.argv[1] if len(sys.argv) > 1 else "game.mov"
 frame_number = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+conf_threshold = float(sys.argv[3]) if len(sys.argv) > 3 else 0.25
 model = YOLO("models/court_keypoints.pt")
 
 capture = cv2.VideoCapture(video_path)
@@ -22,7 +23,7 @@ capture.release()
 if not ok:
     raise SystemExit(f"Could not read frame {frame_number} from {video_path}")
 
-result = model(frame, verbose=False)[0]
+result = model(frame, conf=conf_threshold, verbose=False)[0]
 out = frame.copy()
 
 if result.boxes is not None and len(result.boxes) > 0:
