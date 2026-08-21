@@ -5,7 +5,12 @@ footage via the inverse homography -- so you can see by eye whether the
 computed court boundary actually lines up with the real floor, instead of
 reading coordinate dumps.
 
-Usage: python3 make_debug_video.py <video> [conf] [num_frames]
+Uses auto_homography() (classical-CV floor detection), same as the
+default CLI/web pipeline -- NOT the keypoint model, which requires a
+full end-to-end court view (both baselines in frame) that half-court
+broadcast angles don't provide.
+
+Usage: python3 make_debug_video.py <video> [num_frames]
 Output: court_analysis_debug.mp4
 """
 import sys
@@ -14,10 +19,9 @@ import numpy as np
 import courtiq_core as c
 
 video_path = sys.argv[1] if len(sys.argv) > 1 else "game.mov"
-conf = float(sys.argv[2]) if len(sys.argv) > 2 else 0.1
-num_frames = int(sys.argv[3]) if len(sys.argv) > 3 else 300
+num_frames = int(sys.argv[2]) if len(sys.argv) > 2 else 300
 
-H = c.keypoint_model_homography(video_path, "models/court_keypoints.pt", conf_threshold=conf)
+H = c.auto_homography(video_path)
 H_inv = np.linalg.inv(H)
 
 player_model = c._load_model("models/basketball_players.pt")
