@@ -408,6 +408,12 @@ COURT_HSV_UPPER = (30, 200, 255)
 COURT_CLOSE_KERNEL_FRACTION = 0.03
 COURT_OPEN_KERNEL_FRACTION = 0.03
 COURT_MIN_AREA_FRACTION = 0.15
+# A real court floor, viewed from an elevated broadcast-style angle, never
+# fills nearly the whole frame -- crowd/bleachers/ceiling take up a
+# meaningful share above it. A contour approaching the full frame area is
+# the signature of crowd bleeding into the floor mask (measured on real
+# footage: a bad detection hit 79.5%), not a legitimate detection.
+COURT_MAX_AREA_FRACTION = 0.65
 # A floor row is mostly one continuous wood-colored span (interrupted only
 # by players/painted lines); a crowd row is chopped into many short
 # wood-matching fragments (individual people's clothing) with gaps.
@@ -416,8 +422,8 @@ COURT_MIN_AREA_FRACTION = 0.15
 # even over the crowd -- video compression flattens exactly the
 # fine-texture detail edge density depends on, so it doesn't reliably
 # survive real footage). This should be more robust to that.
-COURT_ROW_RUN_MIN_FRACTION = 0.35  # longest run must span this much of the row's width
-COURT_ROW_SUSTAIN_COUNT = 15       # ...for this many consecutive rows, to count as "floor starts here"
+COURT_ROW_RUN_MIN_FRACTION = 0.25  # longest run must span this much of the row's width
+COURT_ROW_SUSTAIN_COUNT = 10       # ...for this many consecutive rows, to count as "floor starts here"
 
 
 def _odd_kernel(size_px: float) -> int:
@@ -519,8 +525,18 @@ def court_quad_debug(frame) -> dict:
 
     top_row = find_court_top_row(color_mask)
     result["court_top_row"] = top_row
+    if top_row is None:
+        # find_court_top_row() exists specifically to exclude the crowd/
+        # bleachers from the floor mask before contour detection. If it
+        # couldn't find that transition, running contour detection on the
+        # unfiltered mask anyway silently lets the crowd back in -- this
+        # previously produced a "quad" that was actually floor+bleachers
+        # merged into one ~80%-of-frame blob, since nothing was ever
+        # zeroed out. Fail loudly instead of returning a wrong quad.
+        result["reason"] = "could not find a floor/crowd row transition -- refusing to trust the unfiltered mask"
+        return result
     mask = color_mask.copy()
-    if top_row is not None and top_row > 0:
+    if top_row > 0:
         mask[:top_row, :] = 0
 
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
@@ -538,6 +554,12 @@ def court_quad_debug(frame) -> dict:
     result["largest_contour_fraction"] = area_fraction
     if area_fraction < COURT_MIN_AREA_FRACTION:
         result["reason"] = f"largest surviving contour is only {area_fraction:.1%} of the frame (< {COURT_MIN_AREA_FRACTION:.0%} minimum)"
+        return result
+    if area_fraction > COURT_MAX_AREA_FRACTION:
+        result["reason"] = (
+            f"largest surviving contour is {area_fraction:.1%} of the frame (> {COURT_MAX_AREA_FRACTION:.0%} "
+            f"maximum) -- this is the signature of crowd/bleachers merging into the floor mask, not a real detection"
+        )
         return result
 
     peri = cv2.arcLength(accepted, True)
