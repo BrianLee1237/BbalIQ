@@ -348,7 +348,7 @@ def load_camera_calibration(camera_name: str) -> Optional["np.ndarray"]:
     return np.array(json.loads(path.read_text()), dtype=np.float64)
 
 
-def calibrate_camera(video_path: str, camera_name: Optional[str] = None) -> "np.ndarray":
+def calibrate_camera(video_path: str, camera_name: Optional[str] = None, force_manual: bool = False) -> "np.ndarray":
     """The practical, ship-it calibration strategy: automatic detection
     first (detect_court_quad(), no manual work), and ONLY when that fails
     (no confident floor boundary -- see the max/min-area sanity checks in
@@ -365,7 +365,7 @@ def calibrate_camera(video_path: str, camera_name: Optional[str] = None) -> "np.
     See default_full_frame_homography()'s docstring and detect_court_quad()'s
     docstring for why silently guessing wrong is worse than asking once.
     """
-    if camera_name:
+    if camera_name and not force_manual:
         cached = load_camera_calibration(camera_name)
         if cached is not None:
             print(f"[courtiq_core] Using cached calibration for camera '{camera_name}'.")
@@ -379,7 +379,7 @@ def calibrate_camera(video_path: str, camera_name: Optional[str] = None) -> "np.
     if not ok:
         raise RuntimeError(f"Could not read a frame from {video_path}.")
 
-    quad = detect_court_quad(frame)
+    quad = None if force_manual else detect_court_quad(frame)
     if quad is not None:
         print("[courtiq_core] Automatic court-floor detection succeeded -- no manual calibration needed.")
         landmark_names = ["halfcourt_left", "halfcourt_right", "baseline_right", "baseline_left"]
@@ -1671,6 +1671,16 @@ def main():
              "Takes priority over --interactive/automatic when set.",
     )
     parser.add_argument(
+        "--force-manual", action="store_true",
+        help="Used with --camera: skip automatic detection entirely and go straight to the "
+             "manual click, even if detect_court_quad() would technically return a quad. Use "
+             "this to (re)establish a correct calibration when automatic detection found A "
+             "quad but the WRONG one (e.g. it found only part of the floor) -- "
+             "detect_court_quad() only checks that a plausible-shaped/sized region was found, "
+             "not that it's actually the full correct boundary, so it can be technically "
+             "non-empty and still wrong.",
+    )
+    parser.add_argument(
         "--keypoint-model", default=None,
         help="Path to a trained court-keypoint model (see keypoint_model_homography() "
              "and KEYPOINT_MODEL_COURT_POINTS_FT). Overrides --interactive/automatic "
@@ -1710,7 +1720,7 @@ def main():
     elif args.keypoint_model:
         homography = keypoint_model_homography(args.video, args.keypoint_model, conf_threshold=args.keypoint_conf)
     elif args.camera:
-        homography = calibrate_camera(args.video, camera_name=args.camera)
+        homography = calibrate_camera(args.video, camera_name=args.camera, force_manual=args.force_manual)
     elif args.interactive:
         homography = pick_corners_interactive(args.video)
     else:
