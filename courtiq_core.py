@@ -495,8 +495,8 @@ COURT_MAX_AREA_FRACTION = 0.65
 # survive real footage). This should be more robust to that.
 COURT_ROW_RUN_MIN_FRACTION = 0.25  # longest run must span this much of the row's width
 COURT_ROW_SUSTAIN_COUNT = 10       # ...for this many consecutive rows, to count as "floor starts here"
-COURT_ROW_CLOSE_KERNEL_FRACTION = 0.12  # horizontal close width (fraction of frame width), to bridge
-                                         # gaps from logos/lines/players without bridging floor-to-crowd
+COURT_ROW_CLOSE_KERNEL_FRACTION = 0.02  # horizontal close width -- bridges thin painted lines only;
+                                         # a court logo is handled separately by _fill_enclosed_holes()
 
 
 def _odd_kernel(size_px: float) -> int:
@@ -524,6 +524,38 @@ def _longest_run_fraction_per_row(mask) -> "np.ndarray":
     return fractions
 
 
+def _fill_enclosed_holes(mask) -> "np.ndarray":
+    """Fill regions of the mask that are 0 (not floor-colored) but fully
+    ENCLOSED by 1 (floor-colored) pixels on all sides -- e.g. a dark court
+    logo painted on the floor, which doesn't match the wood-color range
+    but sits entirely inside the floor region.
+
+    This is a real topological distinction, not a size guess: a court
+    logo is surrounded by floor and never touches the frame border, while
+    gaps between crowd members connect outward to the rest of the crowd
+    and ultimately the frame border. Flood-filling the INVERTED mask from
+    the border finds exactly the "reachable from outside" 0-regions (real
+    non-floor -- crowd, background); whatever 0-regions are NOT reached
+    are enclosed holes, which get filled back to floor-colored.
+
+    This fixes the logo problem without needing a bridging-kernel size
+    that (as measured on real footage) can't distinguish a large logo gap
+    from equally-large gaps between crowd members -- any kernel wide
+    enough to bridge one bridges the other too.
+    """
+    height, width = mask.shape
+    inverted = (mask == 0).astype(np.uint8) * 255
+    flood_mask = np.zeros((height + 2, width + 2), np.uint8)
+    reachable = inverted.copy()
+    cv2.floodFill(reachable, flood_mask, (0, 0), 128)
+    # Anything still 255 in `reachable` is a 0-region that flood fill from
+    # the border never reached -- i.e. fully enclosed by floor-colored pixels.
+    enclosed = reachable == 255
+    filled = mask.copy()
+    filled[enclosed] = 255
+    return filled
+
+
 def find_court_top_row(color_mask) -> Optional[int]:
     """Scan down from the top of the frame for the first row where the
     longest unbroken wood-colored run is wide AND stays wide for
@@ -542,8 +574,9 @@ def find_court_top_row(color_mask) -> Optional[int]:
     this, a single logo or a row of players interrupting the run was
     enough to make an otherwise-clean floor row fail the width check.
     """
+    filled = _fill_enclosed_holes(color_mask)
     close_k = _odd_kernel(color_mask.shape[1] * COURT_ROW_CLOSE_KERNEL_FRACTION)
-    closed = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, np.ones((1, close_k), np.uint8))
+    closed = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, np.ones((1, close_k), np.uint8))
     run_fraction = _longest_run_fraction_per_row(closed)
     height = len(run_fraction)
     wide = run_fraction >= COURT_ROW_RUN_MIN_FRACTION
@@ -620,7 +653,7 @@ def court_quad_debug(frame) -> dict:
         # zeroed out. Fail loudly instead of returning a wrong quad.
         result["reason"] = "could not find a floor/crowd row transition -- refusing to trust the unfiltered mask"
         return result
-    mask = color_mask.copy()
+    mask = _fill_enclosed_holes(color_mask)
     if top_row > 0:
         mask[:top_row, :] = 0
 
