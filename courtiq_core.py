@@ -687,8 +687,150 @@ def court_quad_debug(frame) -> dict:
         approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
     points = approx.reshape(-1, 2).astype(float)
-    result["quad"] = order_quad_points(points)
+    color_quad = order_quad_points(points)
+    result["color_quad"] = color_quad
+
+    # A painted-line-detection refinement (refine_quad_to_painted_lines())
+    # was attempted here, to snap the color-region quad to the court's
+    # actual boundary lines instead of "where does the wood color stop."
+    # Tested against real footage, it locked onto the wrong lines (the
+    # arc/logo, not the boundary) and produced a clearly worse result than
+    # the plain color-region quad -- see the git history for the attempt.
+    # NOT wired in until it's actually validated; using the color-region
+    # quad directly is the working, tested behavior.
+    result["quad"] = color_quad
+    result["line_refined"] = False
     return result
+
+
+LINE_WHITE_V_MIN = 170       # painted court lines are bright; value channel floor
+LINE_WHITE_S_MAX = 90        # ...and low-saturation (white/near-white paint)
+LINE_MIN_LENGTH_FRACTION = 0.12   # a real boundary line segment must span at least this much of the frame diagonal
+LINE_MAX_GAP_FRACTION = 0.01      # HoughLinesP gap tolerance, as a fraction of frame diagonal
+LINE_ANGLE_CLUSTER_TOLERANCE_DEG = 15  # segments within this many degrees of each other are "the same orientation"
+
+
+def _detect_line_segments(frame, floor_mask):
+    """Find long, straight, bright/low-saturation line segments confined
+    to the floor region -- candidates for the court's actual painted
+    boundary lines (sideline, baseline, etc), as opposed to the crowd,
+    scoreboard text, or anything else bright elsewhere in the frame.
+    """
+    height, width = frame.shape[:2]
+    diag = math.hypot(height, width)
+    dilate_k = _odd_kernel(width * 0.01)
+    roi = cv2.dilate(floor_mask, np.ones((dilate_k, dilate_k), np.uint8))
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    white_mask = cv2.inRange(
+        hsv, np.array([0, 0, LINE_WHITE_V_MIN]), np.array([180, LINE_WHITE_S_MAX, 255])
+    )
+    white_mask = cv2.bitwise_and(white_mask, roi)
+
+    edges = cv2.Canny(white_mask, 50, 150)
+    min_length = int(diag * LINE_MIN_LENGTH_FRACTION)
+    max_gap = int(diag * LINE_MAX_GAP_FRACTION)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40,
+                             minLineLength=min_length, maxLineGap=max_gap)
+    if lines is None:
+        return []
+    return [tuple(line) for line in lines.reshape(-1, 4)]
+
+
+def _line_angle_deg(segment) -> float:
+    x1, y1, x2, y2 = segment
+    return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180
+
+
+def _line_to_general_form(segment):
+    """(x1,y1,x2,y2) -> (a, b, c) for the line ax + by + c = 0, normalized."""
+    x1, y1, x2, y2 = segment
+    a, b = y2 - y1, x1 - x2
+    c = -(a * x1 + b * y1)
+    norm = math.hypot(a, b) or 1.0
+    return a / norm, b / norm, c / norm
+
+
+def _intersect_lines(l1, l2):
+    a1, b1, c1 = l1
+    a2, b2, c2 = l2
+    det = a1 * b2 - a2 * b1
+    if abs(det) < 1e-6:
+        return None
+    x = (b1 * c2 - b2 * c1) / det
+    y = (a2 * c1 - a1 * c2) / det
+    return (x, y)
+
+
+def refine_quad_to_painted_lines(frame, floor_mask, fallback_quad):
+    """Refine a color-region quad to the court's actual painted boundary
+    lines. Detects candidate line segments (see _detect_line_segments()),
+    groups them into two roughly-perpendicular orientation clusters
+    (the two "sideline-like" directions and the two "baseline-like"
+    directions a real court boundary has, even when the whole thing is
+    diagonal in-frame), keeps the longest segment representing each of the
+    4 sides, and intersects adjacent sides to get the 4 true corners.
+
+    Returns None (caller should keep the color-region quad instead) if
+    fewer than 4 well-separated boundary lines were found -- a partial or
+    unclear line-detection result is worse than the honest color-region
+    approximation, not better.
+    """
+    if cv2 is None or np is None:
+        return None
+    segments = _detect_line_segments(frame, floor_mask)
+    if len(segments) < 4:
+        return None
+
+    # Cluster by angle (mod 180) into 2 perpendicular-ish groups using the
+    # angle relative to the first segment, wrapped to [-90, 90).
+    base_angle = _line_angle_deg(segments[0])
+    group_a, group_b = [], []
+    for seg in segments:
+        angle = _line_angle_deg(seg)
+        diff = (angle - base_angle + 90) % 180 - 90
+        (group_a if abs(diff) < LINE_ANGLE_CLUSTER_TOLERANCE_DEG else group_b).append(seg)
+    if len(group_a) < 2 or len(group_b) < 2:
+        return None
+
+    def two_most_separated(group):
+        # Within one orientation, the two real boundary lines (e.g. both
+        # sidelines) are the ones farthest apart perpendicular to their
+        # own direction -- not just the two longest segments, which could
+        # both be the same line detected twice.
+        lines = [_line_to_general_form(s) for s in group]
+        best_pair, best_dist = None, -1.0
+        for i in range(len(lines)):
+            for j in range(i + 1, len(lines)):
+                a, b, c1 = lines[i]
+                _, _, c2 = lines[j]
+                dist = abs(c1 - c2)
+                if dist > best_dist:
+                    best_dist, best_pair = dist, (i, j)
+        i, j = best_pair
+        return lines[i], lines[j]
+
+    line_a1, line_a2 = two_most_separated(group_a)
+    line_b1, line_b2 = two_most_separated(group_b)
+
+    corners = []
+    for la in (line_a1, line_a2):
+        for lb in (line_b1, line_b2):
+            pt = _intersect_lines(la, lb)
+            if pt is None:
+                return None
+            corners.append(pt)
+
+    height, width = frame.shape[:2]
+    margin = max(width, height) * 0.5
+    for x, y in corners:
+        if not (-margin <= x <= width + margin and -margin <= y <= height + margin):
+            # A detected "corner" wildly outside the frame means the line
+            # pairing was wrong (near-parallel lines intersecting far away) --
+            # don't trust it.
+            return None
+
+    return order_quad_points(corners)
 
 
 def auto_homography(video_path: str) -> "np.ndarray":

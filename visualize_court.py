@@ -18,6 +18,7 @@ print(f"color mask coverage:  {debug['color_coverage']:.1%} of frame")
 print(f"court_top_row:        {debug['court_top_row']} (of {frame.shape[0]} total rows)")
 print(f"morphed color mask:   {debug['morphed_coverage']:.1%} of frame")
 print(f"accepted region:      {debug['largest_contour_fraction']:.1%} of frame")
+print(f"line-refined:          {debug.get('line_refined')}")
 if debug["reason"]:
     print(f"FAILED: {debug['reason']}")
 else:
