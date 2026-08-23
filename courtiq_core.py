@@ -326,6 +326,77 @@ def pick_corners_interactive(video_path: str) -> "np.ndarray":
     return compute_homography(clicked[: len(names)], names)
 
 
+CALIBRATION_CACHE_DIR = Path(__file__).resolve().parent / "calibrations"
+
+
+def save_camera_calibration(camera_name: str, homography: "np.ndarray") -> Path:
+    """Save a homography to disk, keyed by camera_name, so a one-time manual
+    calibration (see calibrate_camera()) can be reused for every future video
+    from the same fixed camera setup instead of re-clicking every time.
+    """
+    CALIBRATION_CACHE_DIR.mkdir(exist_ok=True)
+    path = CALIBRATION_CACHE_DIR / f"{camera_name}.json"
+    path.write_text(json.dumps(homography.tolist()))
+    return path
+
+
+def load_camera_calibration(camera_name: str) -> Optional["np.ndarray"]:
+    """Load a previously saved calibration for camera_name, or None if none exists yet."""
+    path = CALIBRATION_CACHE_DIR / f"{camera_name}.json"
+    if not path.exists():
+        return None
+    return np.array(json.loads(path.read_text()), dtype=np.float64)
+
+
+def calibrate_camera(video_path: str, camera_name: Optional[str] = None) -> "np.ndarray":
+    """The practical, ship-it calibration strategy: automatic detection
+    first (detect_court_quad(), no manual work), and ONLY when that fails
+    (no confident floor boundary -- see the max/min-area sanity checks in
+    court_quad_debug()), fall back to a one-time manual click
+    (pick_corners_interactive()). If camera_name is given, that manual
+    result is cached to disk and reused automatically for every future
+    video passed with the same camera_name -- so the manual step happens
+    at most once per fixed camera setup, not once per video.
+
+    This exists because no automatic method (classical-CV heuristic, or
+    either of the two trained keypoint models evaluated against real
+    footage -- see keypoint_evidence_video.py and the KaliCalib comparison)
+    reliably generalizes to an arbitrary, previously-unseen camera angle.
+    See default_full_frame_homography()'s docstring and detect_court_quad()'s
+    docstring for why silently guessing wrong is worse than asking once.
+    """
+    if camera_name:
+        cached = load_camera_calibration(camera_name)
+        if cached is not None:
+            print(f"[courtiq_core] Using cached calibration for camera '{camera_name}'.")
+            return cached
+
+    if cv2 is None:
+        raise RuntimeError("opencv-python is required.")
+    capture = cv2.VideoCapture(video_path)
+    ok, frame = capture.read()
+    capture.release()
+    if not ok:
+        raise RuntimeError(f"Could not read a frame from {video_path}.")
+
+    quad = detect_court_quad(frame)
+    if quad is not None:
+        print("[courtiq_core] Automatic court-floor detection succeeded -- no manual calibration needed.")
+        landmark_names = ["halfcourt_left", "halfcourt_right", "baseline_right", "baseline_left"]
+        return compute_homography(quad, landmark_names)
+
+    print(
+        "[courtiq_core] Automatic detection found no confident court boundary for this camera angle. "
+        "Falling back to one-time manual calibration -- click the landmarks you can see."
+    )
+    homography = pick_corners_interactive(video_path)
+    if camera_name:
+        path = save_camera_calibration(camera_name, homography)
+        print(f"[courtiq_core] Saved calibration to {path} -- future videos with --camera {camera_name} "
+              f"will reuse it automatically, no clicking needed.")
+    return homography
+
+
 def default_full_frame_homography(width: int, height: int) -> "np.ndarray":
     """Automatic homography with no clicking required: assumes the video
     frame is a straight-on, full-court view and maps its four corners
@@ -1591,6 +1662,15 @@ def main():
              "guess if that fails. See auto_homography() for the accuracy trade-offs.",
     )
     parser.add_argument(
+        "--camera", default=None,
+        help="Name for this camera setup (e.g. 'home_gym_east_angle'). Enables "
+             "calibrate_camera()'s automatic-first, manual-fallback-once strategy: tries "
+             "automatic floor detection, and only if that fails, prompts for a one-time "
+             "manual click -- then caches the result under this name in calibrations/ so "
+             "every future video with the same --camera name reuses it with zero clicking. "
+             "Takes priority over --interactive/automatic when set.",
+    )
+    parser.add_argument(
         "--keypoint-model", default=None,
         help="Path to a trained court-keypoint model (see keypoint_model_homography() "
              "and KEYPOINT_MODEL_COURT_POINTS_FT). Overrides --interactive/automatic "
@@ -1629,6 +1709,8 @@ def main():
         homography = hybrid_homography(args.video, args.hybrid_model)
     elif args.keypoint_model:
         homography = keypoint_model_homography(args.video, args.keypoint_model, conf_threshold=args.keypoint_conf)
+    elif args.camera:
+        homography = calibrate_camera(args.video, camera_name=args.camera)
     elif args.interactive:
         homography = pick_corners_interactive(args.video)
     else:
