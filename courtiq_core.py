@@ -495,6 +495,8 @@ COURT_MAX_AREA_FRACTION = 0.65
 # survive real footage). This should be more robust to that.
 COURT_ROW_RUN_MIN_FRACTION = 0.25  # longest run must span this much of the row's width
 COURT_ROW_SUSTAIN_COUNT = 10       # ...for this many consecutive rows, to count as "floor starts here"
+COURT_ROW_CLOSE_KERNEL_FRACTION = 0.12  # horizontal close width (fraction of frame width), to bridge
+                                         # gaps from logos/lines/players without bridging floor-to-crowd
 
 
 def _odd_kernel(size_px: float) -> int:
@@ -529,8 +531,20 @@ def find_court_top_row(color_mask) -> Optional[int]:
     just be a lucky bleacher-color alignment; a sustained run of them is
     the actual floor starting. Returns the row index, or None if no such
     transition was found (the color signal never looked floor-like).
+
+    A horizontal morphological close is applied first, sized to bridge
+    small internal gaps (painted lines, a court logo, a player standing on
+    the floor) without bridging the much larger gap between the floor and
+    the crowd/bleachers above it (measured on real footage: that gap is a
+    differently-colored band -- a sponsor banner or railing -- that
+    doesn't match the wood-color range in the first place, so a modest
+    close kernel doesn't risk merging floor and crowd together). Without
+    this, a single logo or a row of players interrupting the run was
+    enough to make an otherwise-clean floor row fail the width check.
     """
-    run_fraction = _longest_run_fraction_per_row(color_mask)
+    close_k = _odd_kernel(color_mask.shape[1] * COURT_ROW_CLOSE_KERNEL_FRACTION)
+    closed = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, np.ones((1, close_k), np.uint8))
+    run_fraction = _longest_run_fraction_per_row(closed)
     height = len(run_fraction)
     wide = run_fraction >= COURT_ROW_RUN_MIN_FRACTION
     run_length = 0
