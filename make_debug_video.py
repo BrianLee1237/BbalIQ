@@ -45,11 +45,25 @@ writer = cv2.VideoWriter("court_analysis_debug.mp4", cv2.VideoWriter_fourcc(*"mp
 
 # Court boundary rectangle, inverse-projected into image space -- this is
 # what the code THINKS the court outline is, drawn directly on the real footage.
-boundary_ft = [(0, 0), (49.21, 0), (49.21, 91.86), (0, 91.86)]
-boundary_px = [project_inverse(p) for p in boundary_ft]
+#
+# auto_homography() calibrates using ONLY the near half of the court
+# (baseline_left/right to halfcourt_left/right -- see COURT_LANDMARKS and
+# auto_homography()'s landmark_names), which matches a half-court camera
+# view. Drawing the FULL court boundary here (both baselines) would
+# extrapolate the far half through a homography that was never calibrated
+# for it, producing a huge, wrong-looking box -- draw the same near-half
+# region that was actually calibrated instead.
+half_boundary_ft = [
+    c.COURT_LANDMARKS["baseline_left"], c.COURT_LANDMARKS["baseline_right"],
+    c.COURT_LANDMARKS["halfcourt_right"], c.COURT_LANDMARKS["halfcourt_left"],
+]
+boundary_px = [project_inverse(p) for p in half_boundary_ft]
 
-# All 18 calibration keypoints too, so you can see each individual anchor point.
-keypoint_px = [project_inverse(p) for p in c.KEYPOINT_MODEL_COURT_POINTS_FT]
+# The calibration keypoints actually used (the near-half landmarks), not
+# all 18 KEYPOINT_MODEL_COURT_POINTS_FT -- those belong to the (unused
+# here) keypoint-model path and span the full court, same extrapolation
+# problem as above.
+keypoint_px = [project_inverse(p) for p in half_boundary_ft]
 
 frame_idx = 0
 while frame_idx < num_frames:
