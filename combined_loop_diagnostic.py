@@ -35,8 +35,11 @@ while frame_idx < num_frames:
     if frame_idx % 3 == 0:
         strided_count += 1
         ball_result = ball_model(frame, classes=[ball_class], conf=0.25, verbose=False)[0]
-        if ball_result.boxes is not None and len(ball_result.boxes) > 0:
+        found = ball_result.boxes is not None and len(ball_result.boxes) > 0
+        if found:
             box_found_count += 1
+        if frame_idx % 60 == 0:
+            print(f"DEBUG frame={frame_idx} box_found={found}")
 
     frame_idx += 1
 
