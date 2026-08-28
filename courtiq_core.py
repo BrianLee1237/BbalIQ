@@ -1405,7 +1405,8 @@ def run_pipeline(
             ball_result = ball_model(frame, classes=[ball_class], conf=BALL_DETECT_CONF, verbose=False)[0]
             ball_x_ft = ball_y_ft = None
             detected = False
-            if ball_result.boxes is not None and len(ball_result.boxes) > 0:
+            box_found = ball_result.boxes is not None and len(ball_result.boxes) > 0
+            if box_found:
                 box = max(ball_result.boxes, key=lambda b: float(b.conf[0]))
                 x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
                 ball_x_ft, ball_y_ft = project_point(homography, ((x1 + x2) / 2, (y1 + y2) / 2))
@@ -1414,6 +1415,9 @@ def run_pipeline(
                     ball_detected_count += 1
                 else:
                     ball_x_ft = ball_y_ft = None
+            if frame_idx % 60 == 0:
+                print(f"[courtiq_core] DEBUG frame={frame_idx} box_found={box_found} "
+                      f"ft=({ball_x_ft},{ball_y_ft}) detected={detected}")
             ball_samples.append(BallSample(frame=frame_idx, t=t, x_ft=ball_x_ft, y_ft=ball_y_ft, detected=detected))
 
         frame_idx += 1
