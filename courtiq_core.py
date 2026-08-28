@@ -1457,6 +1457,8 @@ def run_pipeline(
     possessions = segment_possessions(player_samples, ball_samples, fps)
 
     ball_detection_rate = ball_detected_count / len(ball_samples) if ball_samples else 0.0
+    print(f"[courtiq_core] DEBUG: ball_detected_count={ball_detected_count} len(ball_samples)={len(ball_samples)} "
+          f"frame_idx={frame_idx} FRAME_STRIDE={FRAME_STRIDE}")
     if ball_detection_rate < 0.15:
         print(
             f"[courtiq_core] WARNING: on-court ball detection rate is only "
