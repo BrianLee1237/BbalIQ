@@ -179,6 +179,12 @@ TARGET_POSSESSION_HOLD_SECONDS = float(os.environ.get("COURTIQ_POSSESSION_HOLD_S
 # seconds regardless of the video's frame rate.
 MAX_POSSESSION_DIST_FT = 6.0  # ball must be this close to a player's feet
                                # to be considered "in that player's hands"
+TARGET_POSSESSION_SWITCH_CONFIRM_SECONDS = float(os.environ.get("COURTIQ_POSSESSION_SWITCH_CONFIRM_SECONDS", "0.3"))
+# ^ how long a different player must be the nearest-to-ball candidate,
+# consecutively, before segment_possessions() actually switches who holds
+# it -- prevents single-sample "nearest player" jitter (contested rebounds,
+# screens, a crowd near the ball) from fragmenting one real possession into
+# many spurious ones.
 
 # Stage 2 thresholds -- deliberately simple and documented, not hidden.
 OPEN_TEAMMATE_SEPARATION_FT = 6.0     # nearest defender must be this far away
@@ -1522,9 +1528,22 @@ def segment_possessions(player_samples: list, ball_samples: list, fps: float) ->
     # actual tolerance is TARGET_POSSESSION_HOLD_SECONDS regardless of the
     # video's fps or FRAME_STRIDE.
     hold_samples = max(1, round(TARGET_POSSESSION_HOLD_SECONDS * fps / FRAME_STRIDE)) if fps else 6
+    # A different player being nearest for a single sample is not enough to
+    # switch possession -- in a crowded contested-ball moment (a rebound, a
+    # screen, a double-team), the nearest player can flip between two or
+    # three people from sample to sample purely from position jitter, with
+    # the ball never actually changing hands. Require a candidate to be
+    # nearest for several CONSECUTIVE samples before actually switching
+    # current_holder -- real hysteresis, not just the "hold through a gap"
+    # behavior above. Measured on real footage: without this, single-sample
+    # flips fragmented one real possession into dozens of spurious ones (91
+    # "possessions" in a 21-second clip).
+    switch_confirm_samples = max(1, round(TARGET_POSSESSION_SWITCH_CONFIRM_SECONDS * fps / FRAME_STRIDE)) if fps else 2
 
     current_holder = None
     frames_since_seen = 0
+    candidate_holder = None
+    candidate_streak = 0
     holder_by_frame = {}
 
     for ball in ball_samples:
@@ -1532,14 +1551,23 @@ def segment_possessions(player_samples: list, ball_samples: list, fps: float) ->
         if ball.detected and candidates:
             nearest, dist = _nearest_player(ball.x_ft, ball.y_ft, candidates)
             if nearest is not None and dist <= MAX_POSSESSION_DIST_FT:
-                current_holder = nearest.track_id
                 frames_since_seen = 0
+                if nearest.track_id == current_holder:
+                    candidate_holder, candidate_streak = None, 0
+                elif nearest.track_id == candidate_holder:
+                    candidate_streak += 1
+                else:
+                    candidate_holder, candidate_streak = nearest.track_id, 1
+                if candidate_holder is not None and candidate_streak >= switch_confirm_samples:
+                    current_holder = candidate_holder
+                    candidate_holder, candidate_streak = None, 0
             else:
                 frames_since_seen += 1
         else:
             frames_since_seen += 1
         if frames_since_seen > hold_samples:
             current_holder = None
+            candidate_holder, candidate_streak = None, 0
         holder_by_frame[ball.frame] = current_holder
 
     team_by_track = {}
