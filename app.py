@@ -23,10 +23,7 @@ try:
 except ImportError:  # A clearer startup error than a trace during upload.
     cv2 = None
 
-try:
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None
+import courtiq_core
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -36,12 +33,16 @@ STATE_FILE = DATA / "state.json"
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".webm"}
 
+# Long-running tracking/detection runs in a background thread; the frontend
+# polls /api/analyze/status instead of blocking the upload/analyze request.
+JOB_LOCK = threading.Lock()
+JOB = {"status": "idle", "progress": 0, "total": 0, "error": None, "video_path": None}
+
 LOCK = threading.Lock()
-MODEL = None
 
 
 def default_state():
-    return {"video": None, "actions": []}
+    return {"video": None, "actions": [], "tracks_summary": None}
 
 
 def load_state():
@@ -74,102 +75,127 @@ def seconds_label(seconds: float) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
-def detector():
-    """Load the on-device detector only when the first video is uploaded."""
-    global MODEL
-    if YOLO is None:
-        raise RuntimeError("AI analysis needs ultralytics. Install it with: pip install ultralytics")
-    if MODEL is None:
-        weights = ROOT / "yolo11n.pt"
-        if not weights.exists():
-            raise RuntimeError("The CourtIQ AI model is missing. Download yolo11n.pt into this folder, then restart.")
-        MODEL = YOLO(str(weights))
-    return MODEL
+DECISION_TITLES = {
+    "open_teammate_ignored": "Open teammate ignored",
+    "shot_selection": "Shot selection",
+    "spacing": "Spacing",
+    "low_confidence": "Ball tracking too unreliable to grade",
+}
 
 
-def analyze_frame(frame):
-    """Return simple court signals from an on-device YOLO frame inference."""
-    result = detector()(frame, classes=[0, 32], conf=0.18, verbose=False)[0]
-    people, balls = [], []
-    for box in result.boxes:
-        cls = int(box.cls[0])
-        x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
-        center = ((x1 + x2) / 2, (y1 + y2) / 2)
-        (people if cls == 0 else balls).append(center)
-    return people, balls
+def default_homography(video_path: str):
+    """Fully automatic homography, no clicking required: courtiq_core tries
+    classical-CV court-floor detection first (color segmentation -> corner
+    quad), falling back to a full-frame guess if that fails. Both are
+    heuristics, not guaranteed-correct calibration -- see auto_homography()
+    in courtiq_core.py for the accuracy trade-offs. courtiq_core's
+    pick_corners_interactive() remains available for accurate manual
+    calibration but isn't wired into the web UI (no click-based
+    calibration step there yet).
+    """
+    return courtiq_core.auto_homography(video_path)
 
 
-def ai_verdict(people, balls, frame_width, frame_height):
-    """Generate an explainable play summary from visible spacing and the ball."""
-    if len(people) < 2:
-        return "Play not fully visible", "uncertain", "AI could not see enough of the court to grade this action."
-    diagonal = max(1, (frame_width ** 2 + frame_height ** 2) ** 0.5)
-    distances = [
-        ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5 / diagonal
-        for i, a in enumerate(people) for b in people[i + 1:]
-    ]
-    spacing = sum(distances) / len(distances) if distances else 0
-    # COCO's sports-ball detector is imperfect on broadcast video, so we only
-    # name a pass when the ball itself is visible rather than inventing one.
-    if balls and spacing >= 0.17:
-        return "Kickout pass for an open three", "good", "Positive: the ball and players show usable spacing for a perimeter kickout."
-    if balls and spacing < 0.11:
-        return "Attack into a crowded lane", "bad", "Negative: visible players are tightly clustered, reducing clean passing options."
-    if balls:
-        return "Half-court scoring decision", "good" if spacing >= 0.13 else "bad", ("Positive: spacing creates a workable scoring option." if spacing >= 0.13 else "Negative: limited spacing makes this a contested decision.")
-    return "Off-ball spacing action", "good" if spacing >= 0.15 else "bad", ("Positive: players are spread, keeping driving and passing lanes available." if spacing >= 0.15 else "Negative: players are crowded, shrinking the available lanes.")
+def decisions_to_actions(data, interval=5.0):
+    """Turn Stage 2 decisions into the timeline-window shape the existing
+    UI already renders (id/start/end/label/title/analysis/note/thumbnail).
+    Every window's label/analysis is derived from real decisions in
+    data.decisions -- nothing here is invented per-window.
+    """
+    duration = data.duration
+    windows = []
+    start = 0.0
+    while start < duration:
+        windows.append((start, min(duration, start + interval)))
+        start += interval
+    windows = windows[:240]
 
-
-def build_actions(path: Path):
-    if cv2 is None:
-        raise RuntimeError("OpenCV is required. Install it with: pip install opencv-python")
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        raise RuntimeError("This video could not be opened. Try an MP4 encoded with H.264.")
-    fps = capture.get(cv2.CAP_PROP_FPS) or 30
-    frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-    duration = frame_count / fps if fps else 0
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    if duration <= 0:
-        capture.release()
-        raise RuntimeError("The uploaded video has no readable duration.")
-
-    # Five-second windows are deliberately neutral: the app evaluates actions,
-    # never teams or named players.
-    interval = 5
-    starts = list(range(0, max(1, int(duration)), interval))
-    starts = starts[:240]  # prevents an accidentally huge game file from freezing the browser
-    token = uuid.uuid4().hex
     actions = []
-    THUMBS.mkdir(parents=True, exist_ok=True)
-    for index, start in enumerate(starts, 1):
-        middle = min(start + interval / 2, max(0, duration - 0.1))
-        capture.set(cv2.CAP_PROP_POS_MSEC, middle * 1000)
-        ok, frame = capture.read()
-        thumbnail = None
-        title, label, analysis = "Play not fully visible", "uncertain", "AI could not grade this action."
-        if ok:
-            people, balls = analyze_frame(frame)
-            title, label, analysis = ai_verdict(people, balls, width, height)
-            thumb_name = f"{token}-{index}.jpg"
-            thumb_path = THUMBS / thumb_name
-            scale = min(1.0, 480 / max(1, frame.shape[1]))
-            frame = cv2.resize(frame, None, fx=scale, fy=scale)
-            if cv2.imwrite(str(thumb_path), frame):
-                thumbnail = f"/data/thumbnails/{thumb_name}"
+    for index, (win_start, win_end) in enumerate(windows, 1):
+        in_window = [d for d in data.decisions if win_start <= d["t"] < win_end]
+        if not in_window:
+            actions.append({
+                "id": index, "start": win_start, "end": win_end,
+                "label": "uncertain", "title": "No graded decision in this window",
+                "analysis": "No possession-ending or spacing event was flagged by the decision rules in this window.",
+                "note": "", "thumbnail": None,
+            })
+            continue
+        bad = [d for d in in_window if d["verdict"] == "bad"]
+        chosen = bad[0] if bad else in_window[0]
         actions.append({
-            "id": index,
-            "start": start,
-            "end": min(duration, start + interval),
-            "label": label,
-            "title": title,
-            "analysis": analysis,
-            "note": "",
-            "thumbnail": thumbnail,
+            "id": index, "start": win_start, "end": win_end,
+            "label": chosen["verdict"],
+            "title": DECISION_TITLES.get(chosen["type"], chosen["type"]),
+            "analysis": chosen["reason"],
+            "note": "", "thumbnail": None,
         })
-    capture.release()
-    return {"duration": duration, "width": width, "height": height, "actions": actions}
+    return actions
+
+
+def run_analysis_job(path: Path):
+    """Runs in a background thread. Never call this from an HTTP handler
+    directly -- tracking + detection across a full video can take minutes,
+    and the POST handler must return immediately.
+    """
+    try:
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            raise RuntimeError("This video could not be opened. Try an MP4 encoded with H.264.")
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        capture.release()
+        if not width or not height:
+            raise RuntimeError("The uploaded video has no readable dimensions.")
+
+        def progress_cb(done, total):
+            with JOB_LOCK:
+                JOB["progress"] = done
+                JOB["total"] = total
+
+        homography = default_homography(str(path))
+        # Prefer downloaded/trained basketball-specific models over the
+        # COCO fallbacks baked into courtiq_core's defaults, if set up.
+        basketball_ball_model = ROOT / "models" / "basketball_ball.pt"
+        ball_model_path = str(basketball_ball_model) if basketball_ball_model.exists() else courtiq_core.BALL_MODEL_PATH
+        basketball_player_model = ROOT / "models" / "basketball_players.pt"
+        player_model_path = str(basketball_player_model) if basketball_player_model.exists() else courtiq_core.PLAYER_MODEL_PATH
+        data = courtiq_core.analyze_video(
+            str(path), homography,
+            ball_model_path=ball_model_path, player_model_path=player_model_path,
+            progress_cb=progress_cb,
+        )
+        actions = decisions_to_actions(data)
+        tracks_path = path.with_suffix(".tracks.json")
+        tracks_path.write_text(json.dumps(courtiq_core.to_json_dict(data), indent=2))
+
+        with LOCK:
+            STATE["video"].update({"duration": data.duration, "width": width, "height": height})
+            STATE["actions"] = actions
+            STATE["tracks_summary"] = {
+                "ball_detection_rate": data.ball_detection_rate,
+                "track_count": len(data.tracks),
+                "possession_count": len(data.possessions),
+                "decision_count": len(data.decisions),
+                "iq_scores": {str(k): v for k, v in data.iq_scores.items()},
+            }
+            save_state(STATE)
+        with JOB_LOCK:
+            JOB["status"] = "done"
+    except Exception as exc:  # noqa: BLE001 - reported to the polling client, not swallowed
+        print(f"[analysis job] failed: {exc}")
+        with JOB_LOCK:
+            JOB["status"] = "error"
+            JOB["error"] = str(exc)
+
+
+def start_analysis_job(path: Path):
+    with JOB_LOCK:
+        if JOB["status"] == "running":
+            raise ValueError("An analysis is already running.")
+        JOB.update({"status": "running", "progress": 0, "total": 0, "error": None, "video_path": str(path)})
+    thread = threading.Thread(target=run_analysis_job, args=(path,), daemon=True)
+    thread.start()
 
 
 class CourtIQHandler(SimpleHTTPRequestHandler):
@@ -201,7 +227,14 @@ class CourtIQHandler(SimpleHTTPRequestHandler):
                 bad = sum(a["label"] == "bad" for a in actions)
                 reviewed = good + bad
                 score = round(100 * good / reviewed) if reviewed else None
-                self.send_json({"reviewed": reviewed, "good": good, "bad": bad, "score": score, "actions": actions})
+                self.send_json({
+                    "reviewed": reviewed, "good": good, "bad": bad, "score": score,
+                    "actions": actions, "tracks_summary": STATE.get("tracks_summary"),
+                })
+            return
+        if route == "/api/analyze/status":
+            with JOB_LOCK:
+                self.send_json(dict(JOB))
             return
         if route == "/" or route == "/index.html":
             self.path = "/index.html"
@@ -252,11 +285,15 @@ class CourtIQHandler(SimpleHTTPRequestHandler):
                     raise RuntimeError("The upload ended before the full video arrived.")
                 output.write(chunk)
                 remaining -= len(chunk)
-        metadata = build_actions(destination)
         with LOCK:
-            STATE["video"] = {"name": filename, "url": f"/data/uploads/{stored}", **{k: metadata[k] for k in ("duration", "width", "height")}}
-            STATE["actions"] = metadata["actions"]
+            STATE["video"] = {"name": filename, "url": f"/data/uploads/{stored}", "duration": 0, "width": 0, "height": 0}
+            STATE["actions"] = []
+            STATE["tracks_summary"] = None
             save_state(STATE)
+        # Tracking + detection across a full video can take minutes; never
+        # run it synchronously inside this POST handler. The frontend polls
+        # /api/analyze/status for progress.
+        start_analysis_job(destination)
         self.send_json(STATE, HTTPStatus.CREATED)
 
     def update_action(self):
@@ -275,7 +312,7 @@ class CourtIQHandler(SimpleHTTPRequestHandler):
         self.send_json(action)
 
     def reanalyze(self):
-        """Apply the current AI to an already-uploaded video."""
+        """Kick off a fresh background analysis of the already-uploaded video."""
         with LOCK:
             video = STATE.get("video")
         if not video:
@@ -284,11 +321,7 @@ class CourtIQHandler(SimpleHTTPRequestHandler):
         path = UPLOADS / stored_name
         if not path.exists():
             raise ValueError("The uploaded video is no longer available. Upload it again.")
-        metadata = build_actions(path)
-        with LOCK:
-            STATE["video"].update({k: metadata[k] for k in ("duration", "width", "height")})
-            STATE["actions"] = metadata["actions"]
-            save_state(STATE)
+        start_analysis_job(path)
         self.send_json(STATE)
 
     def reset(self):
