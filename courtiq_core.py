@@ -102,8 +102,8 @@ PERSON_CLASS_NAMES = {"person", "player"}
 # which spawn spurious short-lived tracks and inflate fragmentation.
 PLAYER_DETECT_CONF = float(os.environ.get("COURTIQ_PLAYER_CONF", os.environ.get("COURTIQ_DETECT_CONF", "0.4")))
 BALL_DETECT_CONF = float(os.environ.get("COURTIQ_BALL_CONF", os.environ.get("COURTIQ_DETECT_CONF", "0.25")))
-BALL_MODEL_PATH = os.environ.get("COURTIQ_BALL_MODEL", "yolo11n.pt")
-PLAYER_MODEL_PATH = os.environ.get("COURTIQ_PLAYER_MODEL", "yolo11n.pt")
+BALL_MODEL_PATH = os.environ.get("COURTIQ_BALL_MODEL", "models/basketball_ball.pt")
+PLAYER_MODEL_PATH = os.environ.get("COURTIQ_PLAYER_MODEL", "models/basketball_players.pt")
 
 # Bundled BoT-SORT config with camera motion compensation (see
 # courtiq_botsort.yaml for what changed from ultralytics' defaults and
@@ -1336,7 +1336,13 @@ def run_pipeline(
         raise RuntimeError("opencv-python is required. Install it with: pip install opencv-python")
 
     player_model = _load_model(player_model_path)
-    ball_model = player_model if ball_model_path == player_model_path else _load_model(ball_model_path)
+    # Always load a separate ball_model instance, even if the paths happen
+    # to match -- aliasing ball_model to the SAME object as player_model
+    # let player_model.track(persist=True)'s internal tracker/predictor
+    # state leak into the "separate" ball detection call on every frame,
+    # which (measured on real footage) silently degraded ball detection
+    # far below what the same weights produce when loaded independently.
+    ball_model = _load_model(ball_model_path)
     ball_class = resolve_ball_class(ball_model)
     person_class = resolve_person_class(player_model)
 
@@ -1415,9 +1421,6 @@ def run_pipeline(
                     ball_detected_count += 1
                 else:
                     ball_x_ft = ball_y_ft = None
-            if frame_idx % 60 == 0:
-                print(f"[courtiq_core] DEBUG frame={frame_idx} box_found={box_found} "
-                      f"ft=({ball_x_ft},{ball_y_ft}) detected={detected}")
             ball_samples.append(BallSample(frame=frame_idx, t=t, x_ft=ball_x_ft, y_ft=ball_y_ft, detected=detected))
 
         frame_idx += 1
@@ -1461,8 +1464,6 @@ def run_pipeline(
     possessions = segment_possessions(player_samples, ball_samples, fps)
 
     ball_detection_rate = ball_detected_count / len(ball_samples) if ball_samples else 0.0
-    print(f"[courtiq_core] DEBUG: ball_detected_count={ball_detected_count} len(ball_samples)={len(ball_samples)} "
-          f"frame_idx={frame_idx} FRAME_STRIDE={FRAME_STRIDE}")
     if ball_detection_rate < 0.15:
         print(
             f"[courtiq_core] WARNING: on-court ball detection rate is only "
