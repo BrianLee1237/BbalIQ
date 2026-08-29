@@ -140,7 +140,7 @@ MIN_TRACK_DURATION_SECONDS = float(os.environ.get("COURTIQ_MIN_TRACK_SECONDS", "
 # Skipping only ball detection still cuts total inference cost
 # meaningfully, since the ball doesn't need frame-to-frame continuity the
 # same way -- possession logic already tolerates gaps via
-# POSSESSION_HOLD_FRAMES.
+# TARGET_POSSESSION_HOLD_SECONDS.
 FRAME_STRIDE = max(1, int(os.environ.get("COURTIQ_FRAME_STRIDE", "3")))
 
 # Standard NBA half-court reference dimensions, in feet, used as defaults
@@ -164,8 +164,19 @@ COURT_WIDTH_FT = 50.0
 COURT_LENGTH_FT = 94.0
 ON_COURT_MARGIN_FT = 4.0  # tolerance beyond the painted lines for player feet
 
-POSSESSION_HOLD_FRAMES = 6  # frames the ball can go undetected before we
-                             # decide possession has actually changed
+TARGET_POSSESSION_HOLD_SECONDS = float(os.environ.get("COURTIQ_POSSESSION_HOLD_SECONDS", "1.0"))
+# ^ how long (real time) the ball can go undetected before we decide
+# possession has actually changed. A FIXED frame count here (the previous
+# POSSESSION_HOLD_FRAMES=6) meant this tolerance shrank as video fps grew --
+# on a 58fps clip it was only ~0.1s of raw video time, and since
+# frames_since_seen in segment_possessions() actually counts ball SAMPLES
+# (which only occur every FRAME_STRIDE'th frame, not every frame), it was
+# really ~0.3s. Either way, real ball-detection gaps (occlusion, motion
+# blur, a contested rebound) routinely exceed that, which was silently
+# fragmenting one real possession into dozens of spurious ones -- measured
+# on real footage: 91 "possessions" in a 21-second clip, physically
+# impossible. Scaling by fps/FRAME_STRIDE keeps the tolerance in real
+# seconds regardless of the video's frame rate.
 MAX_POSSESSION_DIST_FT = 6.0  # ball must be this close to a player's feet
                                # to be considered "in that player's hands"
 
@@ -1372,7 +1383,7 @@ def run_pipeline(
         # multiplies how far players appear to move between calls, breaking
         # that matching and fragmenting track IDs. Only ball detection --
         # which doesn't need frame-to-frame continuity the same way, since
-        # possession logic already tolerates gaps via POSSESSION_HOLD_FRAMES
+        # possession logic already tolerates gaps via TARGET_POSSESSION_HOLD_SECONDS
         # -- is strided, to still cut overall inference cost.
         ok, frame = capture.read()
         if not ok:
@@ -1504,6 +1515,14 @@ def segment_possessions(player_samples: list, ball_samples: list, fps: float) ->
     for sample in player_samples:
         players_by_frame[sample.frame].append(sample)
 
+    # frames_since_seen counts ball SAMPLES, not raw video frames -- ball
+    # detection only runs every FRAME_STRIDE'th frame (see run_pipeline()),
+    # so the real-time gap this hold represents is
+    # hold_samples * FRAME_STRIDE / fps. Solve for hold_samples so the
+    # actual tolerance is TARGET_POSSESSION_HOLD_SECONDS regardless of the
+    # video's fps or FRAME_STRIDE.
+    hold_samples = max(1, round(TARGET_POSSESSION_HOLD_SECONDS * fps / FRAME_STRIDE)) if fps else 6
+
     current_holder = None
     frames_since_seen = 0
     holder_by_frame = {}
@@ -1519,7 +1538,7 @@ def segment_possessions(player_samples: list, ball_samples: list, fps: float) ->
                 frames_since_seen += 1
         else:
             frames_since_seen += 1
-        if frames_since_seen > POSSESSION_HOLD_FRAMES:
+        if frames_since_seen > hold_samples:
             current_holder = None
         holder_by_frame[ball.frame] = current_holder
 
