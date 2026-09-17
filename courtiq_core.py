@@ -94,6 +94,13 @@ BALL_CLASS_NAMES = {"ball", "basketball", "sports ball"}
 # separate "Ref" class stay excluded automatically, since we only match
 # person-like names, not referee-like ones.
 PERSON_CLASS_NAMES = {"person", "player"}
+# The basketball-trained ball model also has a "Hoop" class. That's worth
+# more than shot-location analysis: the hoop sits at a known court position
+# (centered on the width, ~5ft off the baseline), so finding it in the
+# image identifies WHICH edge of the detected floor region is the baseline
+# -- which is what lets calibration work for any camera angle instead of
+# assuming the camera sits behind a baseline. See detect_hoop().
+HOOP_CLASS_NAMES = {"hoop", "rim", "basket", "net"}
 
 # Separate confidence thresholds for player vs. ball detection -- they were
 # previously shared (COURTIQ_DETECT_CONF), but a low threshold that's
@@ -850,6 +857,71 @@ def refine_quad_to_painted_lines(frame, floor_mask, fallback_quad):
     return order_quad_points(corners)
 
 
+HOOP_ORIENT_MAX_ERROR_FT = 25.0
+
+
+def orient_quad_with_hoop(quad, hoop_px) -> Optional["np.ndarray"]:
+    """Build a homography from a detected floor quad, using the hoop's
+    image position to work out WHICH edge of that quad is the baseline --
+    instead of assuming the camera sits behind a baseline.
+
+    Why not just pick the quad edge nearest the hoop: the rim is 10ft off
+    the floor, so its image position is displaced well away from its floor
+    position (measured on real sideline footage, the rim sits ABOVE the
+    detected floor region entirely). Nearest-edge therefore reliably picks
+    the edge that happens to be "up" in the image -- the far sideline on
+    sideline footage -- not the baseline.
+
+    Instead, try all four cyclic assignments (each puts a different quad
+    edge at the baseline), project the hoop through each, and keep whichever
+    lands it closest to a real hoop position -- (25, 5.25), centered across
+    the court's width and just off the baseline. The three wrong
+    orientations put it somewhere unmistakably implausible (out near a
+    sideline, or up by half-court), so this survives the rim's elevation
+    error even though that error is large.
+
+    Returns None if even the best candidate is implausible, so the caller
+    can fall back rather than trust a bad orientation.
+    """
+    if np is None:
+        raise RuntimeError("numpy is required.")
+    hoop_ft_target = COURT_LANDMARKS["hoop"]
+    # Cyclic order around the court matching the cyclic order around the
+    # quad, so a rotation only changes WHICH edge is the baseline and never
+    # mirrors the court.
+    landmark_names = ["baseline_left", "baseline_right", "halfcourt_right", "halfcourt_left"]
+
+    best = None
+    for rotation in range(4):
+        rotated = [quad[(rotation + k) % 4] for k in range(4)]
+        try:
+            candidate = compute_homography(rotated, landmark_names)
+        except Exception:
+            continue
+        candidate = fix_homography_flip(candidate)
+        hoop_ft = project_point(candidate, hoop_px)
+        error = math.hypot(hoop_ft[0] - hoop_ft_target[0], hoop_ft[1] - hoop_ft_target[1])
+        print(f"[courtiq_core] Court-orientation candidate {rotation}: hoop projects to "
+              f"({hoop_ft[0]:.1f}, {hoop_ft[1]:.1f}) ft, {error:.1f} ft from a real hoop at "
+              f"({hoop_ft_target[0]}, {hoop_ft_target[1]}).")
+        if best is None or error < best[0]:
+            best = (error, candidate, rotation)
+
+    if best is None:
+        return None
+    error, homography, rotation = best
+    if error > HOOP_ORIENT_MAX_ERROR_FT:
+        print(
+            f"[courtiq_core] WARNING: even the best court orientation puts the hoop {error:.1f} ft "
+            f"from where a hoop can actually be (limit {HOOP_ORIENT_MAX_ERROR_FT} ft). The detected "
+            f"floor region probably isn't the court rectangle it's being mapped to -- not trusting "
+            f"this orientation."
+        )
+        return None
+    print(f"[courtiq_core] Using court orientation {rotation} (hoop {error:.1f} ft from a real hoop).")
+    return homography
+
+
 def auto_homography(video_path: str) -> "np.ndarray":
     """Fully automatic homography -- no manual clicking. Tries
     detect_court_quad() on the video's first frame; falls back to
@@ -881,11 +953,25 @@ def auto_homography(video_path: str) -> "np.ndarray":
         "using it for homography without manual clicking. This is a heuristic, not a "
         "guarantee; pass --interactive if results look off."
     )
-    # Assumes the detected floor region roughly spans a full-court view,
-    # with the near baseline at the bottom of the frame (closer to camera)
-    # and the far end (half-court line, in a full-court shot) at the top.
-    # That assumption is approximate for partial-court or heavily angled
-    # views -- same caveat as default_full_frame_homography().
+    hoop_px = detect_hoop(video_path)
+    if hoop_px is not None:
+        oriented = orient_quad_with_hoop(quad, hoop_px)
+        if oriented is not None:
+            return oriented
+
+    # No hoop detected -- fall back to the original fixed assumption: the
+    # camera sits behind a baseline, so image-bottom is the baseline and
+    # image-top is the half-court line, with image left/right spanning the
+    # court's 50ft width. That is wrong for a SIDELINE camera (where the
+    # court's length runs across the image instead), which is exactly what
+    # orient_quad_with_hoop() exists to detect -- so treat this path as a
+    # last resort and say so rather than silently assuming the camera angle.
+    print(
+        "[courtiq_core] WARNING: no hoop detected, so the court's orientation could not be "
+        "determined from the footage. Falling back to assuming a BASELINE-END camera "
+        "(image-bottom = baseline, image-left/right = the court's 50ft width). If this is "
+        "actually sideline footage, every court coordinate will be rotated and wrong."
+    )
     landmark_names = ["halfcourt_left", "halfcourt_right", "baseline_right", "baseline_left"]
     return compute_homography(quad, landmark_names)
 
@@ -1333,6 +1419,69 @@ def resolve_person_class(model) -> int:
         if str(name).strip().lower() in PERSON_CLASS_NAMES:
             return int(idx)
     return PERSON_CLASS_FALLBACK
+
+
+def resolve_hoop_class(model) -> Optional[int]:
+    """Find the hoop/rim class index by name. Unlike the ball and person
+    classes there is no sensible COCO fallback (COCO has no hoop class), so
+    this returns None when the model has no hoop-like class rather than
+    guessing an index that would silently detect something else.
+    """
+    override = os.environ.get("COURTIQ_HOOP_CLASS")
+    if override is not None:
+        return int(override)
+    names = getattr(model, "names", None) or {}
+    for idx, name in names.items():
+        if str(name).strip().lower() in HOOP_CLASS_NAMES:
+            return int(idx)
+    return None
+
+
+HOOP_DETECT_CONF = float(os.environ.get("COURTIQ_HOOP_CONF", "0.25"))
+HOOP_SAMPLE_FRAMES = int(os.environ.get("COURTIQ_HOOP_SAMPLE_FRAMES", "30"))
+
+
+def detect_hoop(video_path: str, model_path: str = BALL_MODEL_PATH) -> Optional[tuple]:
+    """Locate the hoop in image space, as (x_px, y_px), or None if the
+    model has no hoop class or never detects one.
+
+    Samples several frames spread across the video and takes the MEDIAN
+    position rather than trusting one frame: the hoop is static, so a
+    median is robust to the occasional frame where a player's head, the
+    backboard edge, or motion blur produces a bad box. A single-frame
+    detection would silently hand back an outlier.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    model = _load_model(model_path)
+    hoop_class = resolve_hoop_class(model)
+    if hoop_class is None:
+        return None
+
+    capture = cv2.VideoCapture(video_path)
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if frame_count <= 0:
+        capture.release()
+        return None
+    step = max(1, frame_count // HOOP_SAMPLE_FRAMES)
+
+    centers = []
+    for frame_idx in range(0, frame_count, step):
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = capture.read()
+        if not ok:
+            break
+        result = model(frame, classes=[hoop_class], conf=HOOP_DETECT_CONF, verbose=False)[0]
+        if result.boxes is not None and len(result.boxes) > 0:
+            box = max(result.boxes, key=lambda b: float(b.conf[0]))
+            x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+            centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
+    capture.release()
+
+    if not centers:
+        return None
+    arr = np.array(centers, dtype=np.float64)
+    return (float(np.median(arr[:, 0])), float(np.median(arr[:, 1])))
 
 
 def run_pipeline(

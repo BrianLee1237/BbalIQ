@@ -58,12 +58,29 @@ for pt, label in [((3, 0), "3PT-L"), ((47, 0), "3PT-R")]:
     cv2.circle(frame, to_px(pt), 9, (255, 0, 255), -1)
     cv2.putText(frame, label, to_px(pt), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
+# Where the hoop was actually DETECTED in the image (as opposed to the red
+# circle above, which is where the homography THINKS a hoop should be).
+# The gap between the two is the calibration error, made visible.
+hoop_px = c.detect_hoop(video_path)
+if hoop_px is None:
+    print("NOTE: no hoop detected -- court orientation could not be anchored.")
+else:
+    px = tuple(map(int, hoop_px))
+    cv2.circle(frame, px, 16, (0, 255, 0), 4)
+    cv2.putText(frame, "DETECTED HOOP", (px[0] + 20, px[1]),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    hoop_ft = c.project_point(H, hoop_px)
+    print(f"Detected hoop at image {px}, which projects to court ({hoop_ft[0]:.1f}, {hoop_ft[1]:.1f}) ft.")
+    print(f"A real hoop sits at {c.COURT_LANDMARKS['hoop']} ft.")
+
 cv2.imwrite("court_calibration_check.png", frame)
 print("Wrote court_calibration_check.png")
 print()
 print("What to look for:")
 print("  CYAN key box  -> should sit exactly on the real painted key under the hoop")
-print("  RED circle    -> should sit on the actual rim")
+print("  RED circle    -> where the homography THINKS the hoop is")
+print("  GREEN circle  -> where the hoop was actually DETECTED")
+print("  (red and green far apart = calibration error, made visible)")
 print("  MAGENTA dots  -> should sit on the baseline three-point corners")
 print("If these land rotated, mirrored, or somewhere unrelated, the homography's")
 print("court-axis mapping is wrong even if the outline looked correct.")
