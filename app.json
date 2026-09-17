@@ -1,0 +1,101 @@
+{
+  "expo": {
+    "name": "ActiveTrack",
+    "slug": "activetrack",
+    "scheme": "activetrack",
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
+    "version": "0.23.0",
+    "orientation": "landscape",
+    "userInterfaceStyle": "dark",
+    "icon": "./assets/images/icon.png",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.prototype.activetrack",
+      "buildNumber": "23",
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "NSCameraUsageDescription": "ActiveTrack uses the camera to follow the basketball and count makes and misses on your device.",
+        "NSPhotoLibraryAddUsageDescription": "ActiveTrack saves a session recording only when you choose Save Clip.",
+        "UIRequiresFullScreen": true
+      },
+      "privacyManifests": {
+        "NSPrivacyAccessedAPITypes": [
+          {
+            "NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryUserDefaults",
+            "NSPrivacyAccessedAPITypeReasons": [
+              "CA92.1"
+            ]
+          }
+        ]
+      }
+    },
+    "android": {
+      "package": "com.prototype.activetrack",
+      "versionCode": 23,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.READ_MEDIA_VIDEO"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/icon.png",
+        "backgroundColor": "#070A08"
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash.png",
+          "imageWidth": 620,
+          "resizeMode": "contain",
+          "backgroundColor": "#070A08"
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": false,
+          "savePhotosPermission": "Allow ActiveTrack to save your selected session recording.",
+          "isAccessMediaLocationEnabled": false,
+          "granularPermissions": [
+            "video"
+          ]
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow ActiveTrack to select a basketball video for on-device analysis.",
+          "cameraPermission": "ActiveTrack uses the camera to follow the basketball and count makes and misses on this device.",
+          "microphonePermission": false
+        }
+      ],
+      "expo-video",
+      "expo-sharing"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "4f291a75-c3d1-4da6-b085-7e10b91229fa"
+      }
+    },
+    "owner": "vtat"
+  }
+}
