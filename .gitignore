@@ -1,7 +1,10 @@
 node_modules/
 .expo/
 .expo-shared/
-.codex/
+.codex/*
+!.codex/environments/
+.codex/environments/*
+!.codex/environments/environment.toml
 .next/
 .vinext/
 .wrangler/
