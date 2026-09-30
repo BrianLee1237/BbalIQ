@@ -1004,6 +1004,10 @@ KEY_MIN_AREA_FRACTION = 0.005   # a painted region smaller than this is noise, n
 KEY_MAX_AREA_FRACTION = 0.30    # ...larger than this isn't the key either
 FLOOR_REGION_ERODE_FRACTION = 0.008  # pull inside the floor edge so it is not read as paint
 FLOOR_PIECE_MIN_FRACTION = 0.1        # keep floor pieces this big relative to the largest
+PAINT_LINE_KERNEL_FRACTION = 0.006   # wider than a court line, far narrower than the lane.
+# Sized from measurement: below ~0.005 the line network survives and
+# calibration fails outright (11.6ft), while oversizing only rounds the lane's
+# corners and degrades gradually -- so this sits above the cliff, not on it.
 # The lane is pinned to the baseline; paint out in open floor isn't. Measured
 # on synthetic ground truth: real lanes land at 0.05-0.15, an open-floor logo
 # at ~0.54. Sits between the two with margin on both sides rather than hugging
@@ -1084,17 +1088,42 @@ def detect_painted_regions(frame, floor_mask=None) -> list:
     floor_region = cv2.erode(floor_region, np.ones((erode_k, erode_k), np.uint8))
     non_wood = cv2.bitwise_and(non_wood, floor_region)
 
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(non_wood, connectivity=8)
+    # Sever the court's painted LINES before splitting into regions. A real
+    # court is covered in them -- sidelines, the arc, lane lines, the centre
+    # circle -- and they form one connected network joining every painted
+    # area to every other. Measured on real footage, the lane came back fused
+    # with the arc, the logos and the surrounding lines as a single region
+    # covering 46% of the floor, so it could never be isolated by
+    # connectivity alone.
+    #
+    # Lines are thin and the lane is a thick filled block, so opening with a
+    # kernel wider than a line but far narrower than the lane erases the
+    # network and leaves the filled areas standing. Unlike the player-width
+    # kernel tried earlier, a line-width kernel is small enough that rounding
+    # the lane's corners costs almost nothing.
+    line_k = _odd_kernel(width * PAINT_LINE_KERNEL_FRACTION)
+    line_kernel = np.ones((line_k, line_k), np.uint8)
+    seeds = cv2.morphologyEx(non_wood, cv2.MORPH_OPEN, line_kernel)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(seeds, connectivity=8)
     frame_area = float(height * width)
     keep = []
     for label in range(1, count):
-        area = stats[label][4]
-        if not (KEY_MIN_AREA_FRACTION * frame_area <= area <= KEY_MAX_AREA_FRACTION * frame_area):
+        if stats[label][4] <= 0:
             continue
+        # Use the opened component directly. Dilating it back and
+        # intersecting with the un-opened mask to sharpen the corners was
+        # tried and measured worse (1.39ft vs 0.76ft): it drags the severed
+        # lines back in as stubs along the lane's edges, and those distort
+        # the quad more than the kernel's corner-rounding does.
         component = (labels == label).astype(np.uint8) * 255
         contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            keep.append(max(contours, key=cv2.contourArea))
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(contour)
+        if KEY_MIN_AREA_FRACTION * frame_area <= area <= KEY_MAX_AREA_FRACTION * frame_area:
+            keep.append(contour)
     return keep
 
 

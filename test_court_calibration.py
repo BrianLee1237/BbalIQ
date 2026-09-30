@@ -42,17 +42,56 @@ def build(img_points):
     )
 
 
-def render(court_to_img):
+LINE_BGR = (70, 70, 70)
+
+
+def draw_court_markings(frame, to_img, line_bgr=LINE_BGR):
+    """Paint the lines a real court is covered in.
+
+    These matter because they form a connected network: sidelines meeting the
+    baseline, the arc meeting the lane, the centre circle. On real footage
+    that network fused every painted area into one region covering 46% of the
+    floor, so the lane couldn't be isolated. Synthetic courts without lines
+    can't catch that -- their paint sits in splendid isolation, which no real
+    gym does.
+    """
+    def line(a, b):
+        cv2.line(frame, tuple(map(int, to_img(a))), tuple(map(int, to_img(b))), line_bgr, 5)
+
+    # Boundary, lane lines, free-throw line, and a centre line.
+    for a, b in [
+        ((0, 0), (50, 0)), ((0, 0), (0, 47)), ((50, 0), (50, 47)), ((0, 47), (50, 47)),
+        ((17, 0), (17, 19)), ((33, 0), (33, 19)), ((17, 19), (33, 19)),
+        ((0, 28), (50, 28)),
+    ]:
+        line(a, b)
+
+    # Three-point arc, which runs from the lane out to the sidelines.
+    arc = [(25 + 22 * math.cos(th), 5.25 + 22 * math.sin(th))
+           for th in [math.pi * i / 40 for i in range(41)]]
+    for a, b in zip(arc, arc[1:]):
+        line(a, b)
+
+    # Centre circle, touching the centre line.
+    circle = [(25 + 6 * math.cos(th), 28 + 6 * math.sin(th))
+              for th in [2 * math.pi * i / 40 for i in range(41)]]
+    for a, b in zip(circle, circle[1:]):
+        line(a, b)
+
+
+def render(court_to_img, floor_bgr=None, paint_bgr=None, with_markings=True):
     def to_img(pt):
         src = np.array([[[pt[0], pt[1]]]], dtype=np.float32)
         return cv2.perspectiveTransform(src, court_to_img)[0][0]
 
     frame = np.full((IMG_H, IMG_W, 3), CROWD_BGR, dtype=np.uint8)
     for poly, color in [
-        ([(-4, -4), (54, -4), (54, 51), (-4, 51)], WOOD_BGR),
-        (c.KEY_CORNERS_FT, KEY_BGR),
+        ([(-4, -4), (54, -4), (54, 51), (-4, 51)], floor_bgr or WOOD_BGR),
+        (c.KEY_CORNERS_FT, paint_bgr or KEY_BGR),
     ]:
         cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+    if with_markings:
+        draw_court_markings(frame, to_img)
     return frame, to_img
 
 
@@ -121,6 +160,7 @@ def check_occlusion(tmp_path="/tmp/courtiq_occlusion_test.mp4"):
             (c.KEY_CORNERS_FT, KEY_BGR),
         ]:
             cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+        draw_court_markings(frame, to_img)
         if occluded:
             for pos in [(20, 4), (30, 8), (25, 14), (21, 17)]:
                 base = to_img(pos)
@@ -190,6 +230,7 @@ def check_false_hoop():
         ([(18, 22), (32, 22), (32, 32), (18, 32)], KEY_BGR),
     ]:
         cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+    draw_court_markings(frame, to_img)
 
     floor_mask = c.court_quad_debug(frame).get("morphed_color_mask")
     if floor_mask is None:
@@ -247,6 +288,7 @@ def check_crowd_bridge():
         (c.KEY_CORNERS_FT, KEY_BGR),
     ]:
         cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+    draw_court_markings(frame, to_img)
 
     def frame_with_bridge(bridged):
         out = frame.copy()
@@ -326,12 +368,7 @@ def check_floor_colors():
     all_ok = True
 
     for name, (floor_bgr, paint_bgr) in FLOOR_SCHEMES.items():
-        frame = np.full((IMG_H, IMG_W, 3), CROWD_BGR, dtype=np.uint8)
-        for poly, color in [
-            ([(-4, -4), (54, -4), (54, 51), (-4, 51)], floor_bgr),
-            (c.KEY_CORNERS_FT, paint_bgr),
-        ]:
-            cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+        frame, _ = render(court_to_img, floor_bgr=floor_bgr, paint_bgr=paint_bgr)
 
         hoop_floor = to_img((25, 5.25))
         hoop_px = (float(hoop_floor[0]), float(hoop_floor[1]) - 120.0)
