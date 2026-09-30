@@ -857,6 +857,184 @@ def refine_quad_to_painted_lines(frame, floor_mask, fallback_quad):
     return order_quad_points(corners)
 
 
+# The painted key ("the paint"), as court coordinates, in cyclic order
+# starting from the baseline edge. 16ft wide, 19ft from the baseline.
+KEY_CORNERS_FT = [(17.0, 0.0), (33.0, 0.0), (33.0, 19.0), (17.0, 19.0)]
+KEY_MIN_AREA_FRACTION = 0.005   # a painted region smaller than this is noise, not the key
+KEY_MAX_AREA_FRACTION = 0.30    # ...larger than this isn't the key either
+KEY_OPEN_KERNEL_FRACTION = 0.004
+
+
+def detect_painted_regions(frame) -> list:
+    """Find painted court areas -- regions that are NOT wood-colored but are
+    fully enclosed by wood floor: the key, center-circle logos, painted lanes.
+
+    This reuses the same enclosure test as _fill_enclosed_holes(), which
+    already has to identify exactly these regions in order to fill them.
+    Here we want them, not the floor around them: the key is a PAINTED
+    rectangle of known real-world size, which makes it a far better
+    calibration target than the wood-floor outline (the floor includes the
+    out-of-bounds apron, so equating it to the 50x47 court rectangle is
+    wrong by however wide that apron happens to be).
+
+    Deliberately color-AGNOSTIC: it keys off "not wood, enclosed by wood"
+    rather than a specific paint color, so it works whatever color a given
+    gym painted its lane.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    height, width = frame.shape[:2]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    wood = cv2.inRange(hsv, np.array(COURT_HSV_LOWER), np.array(COURT_HSV_UPPER))
+
+    inverted = (wood == 0).astype(np.uint8) * 255
+    flood_mask = np.zeros((height + 2, width + 2), np.uint8)
+    reachable = inverted.copy()
+    cv2.floodFill(reachable, flood_mask, (0, 0), 128)
+    enclosed = (reachable == 255).astype(np.uint8) * 255
+
+    open_k = _odd_kernel(width * KEY_OPEN_KERNEL_FRACTION)
+    enclosed = cv2.morphologyEx(enclosed, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8))
+    contours, _ = cv2.findContours(enclosed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    frame_area = float(height * width)
+    keep = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if KEY_MIN_AREA_FRACTION * frame_area <= area <= KEY_MAX_AREA_FRACTION * frame_area:
+            keep.append(contour)
+    return keep
+
+
+def detect_key_quad(frame, hoop_px) -> Optional[list]:
+    """Pick the painted key out of the painted regions, as 4 image points.
+
+    The key is identified as the painted region closest to the hoop: the
+    lane sits directly under the basket, while the other big painted areas
+    (a center-circle logo, a school name) are out near mid-court. The rim's
+    10ft elevation shifts its image position, but not nearly far enough to
+    make a mid-court logo look closer than the lane directly beneath it.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    contours = detect_painted_regions(frame)
+    if not contours:
+        return None
+
+    best, best_dist = None, None
+    for contour in contours:
+        moments = cv2.moments(contour)
+        if moments["m00"] == 0:
+            continue
+        cx = moments["m10"] / moments["m00"]
+        cy = moments["m01"] / moments["m00"]
+        dist = math.hypot(cx - hoop_px[0], cy - hoop_px[1])
+        if best_dist is None or dist < best_dist:
+            best, best_dist = contour, dist
+    if best is None:
+        return None
+
+    peri = cv2.arcLength(best, True)
+    approx = cv2.approxPolyDP(best, 0.02 * peri, True)
+    if len(approx) != 4:
+        rect = cv2.minAreaRect(best)
+        approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
+    return order_quad_points(approx.reshape(-1, 2).astype(float))
+
+
+def _signed_area(points) -> float:
+    """Shoelace signed area -- its SIGN is the polygon's winding direction."""
+    total = 0.0
+    for i in range(len(points)):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % len(points)]
+        total += x1 * y2 - x2 * y1
+    return total / 2.0
+
+
+def _floor_extent_beyond_edge(floor_mask, centroid, edge_midpoint) -> float:
+    """March outward from an edge of the key, away from its centre, and
+    measure how far the wood floor continues before it runs out.
+
+    This is what tells baseline from free-throw line without relying on the
+    rim: past the baseline there are only a few feet of out-of-bounds apron
+    before the floor ends at the crowd, while past the free-throw line the
+    floor runs on for the rest of the court. Purely a floor measurement, so
+    unlike every rim-geometry shortcut it is immune to the rim's elevation.
+    """
+    height, width = floor_mask.shape
+    dx = edge_midpoint[0] - centroid[0]
+    dy = edge_midpoint[1] - centroid[1]
+    norm = math.hypot(dx, dy)
+    if norm == 0:
+        return 0.0
+    dx, dy = dx / norm, dy / norm
+
+    steps = 0
+    max_steps = int(math.hypot(height, width))
+    x, y = edge_midpoint
+    for step in range(1, max_steps):
+        x = edge_midpoint[0] + dx * step
+        y = edge_midpoint[1] + dy * step
+        ix, iy = int(round(x)), int(round(y))
+        if not (0 <= ix < width and 0 <= iy < height):
+            break
+        if floor_mask[iy, ix] == 0:
+            break
+        steps = step
+    return float(steps)
+
+
+def key_anchored_homography(key_quad, floor_mask) -> Optional["np.ndarray"]:
+    """Calibrate from the painted key -- a known 16x19ft rectangle -- rather
+    than from the wood-floor outline.
+
+    Identifies which key edge is the baseline by how far the floor extends
+    beyond each edge (see _floor_extent_beyond_edge()), then maps the quad
+    to KEY_CORNERS_FT in matching cyclic order so the court is never
+    mirrored.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    centroid = (
+        sum(p[0] for p in key_quad) / 4.0,
+        sum(p[1] for p in key_quad) / 4.0,
+    )
+    extents = []
+    for i in range(4):
+        a, b = key_quad[i], key_quad[(i + 1) % 4]
+        midpoint = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+        extents.append(_floor_extent_beyond_edge(floor_mask, centroid, midpoint))
+    baseline_edge = int(min(range(4), key=lambda i: extents[i]))
+    print(f"[courtiq_core] Floor extent beyond each key edge (px): "
+          f"{[round(e) for e in extents]} -> edge {baseline_edge} is the baseline.")
+
+    rotated = [key_quad[(baseline_edge + k) % 4] for k in range(4)]
+
+    # Guard against mapping the court mirrored. Corner-to-corner assignment
+    # in cyclic order only preserves handedness if the image quad winds the
+    # same way as the court quad; if it winds the other way the court comes
+    # out flipped, which silently swaps left and right everywhere.
+    #
+    # A camera above the floor always preserves winding, so a reversed
+    # winding means the frame itself is mirrored (a horizontally-flipped
+    # recording, e.g. a selfie-mode capture). Fix it by reversing the
+    # traversal -- keeping the same baseline edge -- rather than by negating
+    # a column of the homography, which changes the mapping in ways that
+    # don't correspond to un-mirroring it.
+    if _signed_area(rotated) * _signed_area(KEY_CORNERS_FT) < 0:
+        print("[courtiq_core] Frame appears horizontally mirrored; reversing court winding "
+              "so left/right aren't swapped.")
+        rotated = [rotated[1], rotated[0], rotated[3], rotated[2]]
+
+    src = np.array(rotated, dtype=np.float32)
+    dst = np.array(KEY_CORNERS_FT, dtype=np.float32)
+    homography, _ = cv2.findHomography(src, dst, method=0)
+    if homography is None:
+        return None
+    return homography
+
+
 HOOP_ORIENT_MAX_ERROR_FT = 25.0
 
 
@@ -955,22 +1133,42 @@ def auto_homography(video_path: str) -> "np.ndarray":
     )
     hoop_px = detect_hoop(video_path)
     if hoop_px is not None:
+        # Preferred: calibrate from the painted key. It is a rectangle of
+        # KNOWN real size (16x19ft), unlike the wood-floor outline, which
+        # includes however much out-of-bounds apron the gym happens to have
+        # and so gets the scale wrong even when its shape looks right.
+        key_quad = detect_key_quad(frame, hoop_px)
+        if key_quad is not None:
+            floor_mask = court_quad_debug(frame).get("morphed_color_mask")
+            if floor_mask is not None:
+                key_homography = key_anchored_homography(key_quad, floor_mask)
+                if key_homography is not None:
+                    hoop_ft = project_point(key_homography, hoop_px)
+                    print(f"[courtiq_core] Calibrated from the painted key. Hoop projects to "
+                          f"({hoop_ft[0]:.1f}, {hoop_ft[1]:.1f}) ft (a real hoop is at "
+                          f"{COURT_LANDMARKS['hoop']}; expect several ft of offset since the rim "
+                          f"is 10ft above the floor plane this maps).")
+                    return key_homography
+
+        # Fallback: the floor outline, at least oriented correctly by the hoop.
         oriented = orient_quad_with_hoop(quad, hoop_px)
         if oriented is not None:
             return oriented
 
-    # No hoop detected -- fall back to the original fixed assumption: the
-    # camera sits behind a baseline, so image-bottom is the baseline and
-    # image-top is the half-court line, with image left/right spanning the
-    # court's 50ft width. That is wrong for a SIDELINE camera (where the
-    # court's length runs across the image instead), which is exactly what
-    # orient_quad_with_hoop() exists to detect -- so treat this path as a
-    # last resort and say so rather than silently assuming the camera angle.
+    # Last resort: map the wood-floor outline straight onto the court
+    # rectangle, assuming a baseline-end camera. Measured against synthetic
+    # ground truth (test_court_calibration.py) this is wrong by 36-46 ft on
+    # every camera placement tested -- the floor includes the out-of-bounds
+    # apron, and the baseline-end assumption transposes the axes on sideline
+    # footage. On a 50ft-wide court that is not an approximation, it's noise.
+    # Kept only so the pipeline still produces something rather than dying,
+    # and loudly flagged so nobody builds on it unknowingly.
     print(
-        "[courtiq_core] WARNING: no hoop detected, so the court's orientation could not be "
-        "determined from the footage. Falling back to assuming a BASELINE-END camera "
-        "(image-bottom = baseline, image-left/right = the court's 50ft width). If this is "
-        "actually sideline footage, every court coordinate will be rotated and wrong."
+        "[courtiq_core] WARNING: could not calibrate from the painted key (no key and/or no "
+        "hoop detected). Falling back to mapping the wood-floor outline onto the court "
+        "rectangle, which measured 36-46 ft of error against synthetic ground truth. "
+        "Court positions, possession distances and shot ranges from this run are NOT "
+        "trustworthy -- see test_court_calibration.py."
     )
     landmark_names = ["halfcourt_left", "halfcourt_right", "baseline_right", "baseline_left"]
     return compute_homography(quad, landmark_names)
