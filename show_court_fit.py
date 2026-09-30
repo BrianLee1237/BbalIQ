@@ -78,7 +78,11 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         cv2.line(overlay, rim_px, hoop_px, (0, 255, 0), 1)
 
-    cv2.putText(overlay, f"{model.name} court, {info['cost']:.1f}px marking error",
+    agreement = info.get("paint_agreement")
+    caption = f"{model.name} court, {info['cost']:.1f}px marking error"
+    if agreement is not None:
+        caption += f", key {agreement:.0%}"
+    cv2.putText(overlay, caption,
                 (20, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
     cv2.imwrite("court_fit_overlay.png", overlay)

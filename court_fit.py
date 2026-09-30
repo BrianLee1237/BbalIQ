@@ -71,6 +71,17 @@ COVERAGE_WEIGHT = 25.0
 # sport. Measured on real footage: a 3.0px marking error with the lane sitting
 # in open floor and the arc curving the wrong way.
 HOOP_WEIGHT = 90.0
+
+# The filled painted key, matched by overlap. Lines alone cannot say WHERE on
+# a multi-sport floor the basketball court is, because volleyball, badminton
+# and cross-court keys are painted in the same way and a wrong alignment can
+# land its lines on theirs. A large filled area of paint is different: no
+# other sport has one, so the key's position, the court's front-to-back
+# direction and the lane's width -- which is what separates a high-school
+# court from a college one -- are all pinned by it. Weighted above the
+# markings term because it is the more trustworthy evidence of the two.
+PAINT_WEIGHT = 120.0
+PAINT_MIN_PIXELS = 400
 MAX_COST_PX = 18.0               # mean line-to-model distance we'll still believe
 # The modelled half-court can't be a sliver of the visible floor, nor vastly
 # bigger than it. Bounds are loose -- they exist to rule out collapse, not to
@@ -115,7 +126,7 @@ def median_frame(video_path, samples=31):
     return np.median(np.stack(frames), axis=0).astype(np.uint8)
 
 
-def detect_line_pixels(frame, floor_region, floor_mask=None):
+def detect_line_pixels(frame, floor_region, floor_mask=None, return_paint=False):
     """Thin painted structures inside the floor -- the court's markings.
 
     Markings are thin; filled paint, players and shadows are not. Subtracting
@@ -160,7 +171,8 @@ def detect_line_pixels(frame, floor_region, floor_mask=None):
         if stats[label, cv2.CC_STAT_AREA] >= floor_area * PAINT_MIN_FLOOR_FRACTION:
             paint[labels == label] = 255
     outlines = cv2.morphologyEx(paint, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
-    return cv2.bitwise_or(thin, outlines)
+    markings = cv2.bitwise_or(thin, outlines)
+    return (markings, paint) if return_paint else markings
 
 
 def _distance_to_lines(line_pixels):
@@ -190,7 +202,8 @@ def _is_convex(corners):
 
 def _cost(img_corners, court_corners, model_points, distance, shape,
           floor_area=None, line_cells=None, grid_shape=None,
-          hoop_px=None, hoop_court=None):
+          hoop_px=None, hoop_court=None,
+          paint_img=None, paint_mask=None, lane_grid=None, lane_rect=None):
     """Mean distance from the model's markings to the nearest real marking.
 
     Rejects degenerate hypotheses first. Without that, the search has a
@@ -267,7 +280,50 @@ def _cost(img_corners, court_corners, model_points, distance, shape,
         across = abs(float(projected_hoop[0]) - hoop_px[0]) / max(1.0, width)
         wrong_side = max(0.0, hoop_px[1] - float(projected_hoop[1])) / max(1.0, height)
         total += HOOP_WEIGHT * (across + wrong_side)
+
+    if paint_img is not None and lane_grid is not None:
+        total += PAINT_WEIGHT * (1.0 - _paint_agreement(
+            transform, court_corners, img_corners,
+            paint_img, paint_mask, lane_grid, lane_rect, shape))
     return total
+
+
+def _paint_agreement(transform, court_corners, img_corners,
+                     paint_img, paint_mask, lane_grid, lane_rect, shape):
+    """How well the model's lane and the floor's painted area coincide, 0..1.
+
+    Scored both ways round, because either direction alone is satisfiable by
+    a degenerate answer: a lane shrunk to a point sits entirely inside the
+    paint, and a lane blown up to the whole court contains all of it.
+
+    The paint's pixels are carried back into court coordinates rather than the
+    lane being rasterised into the image, which turns the test into "is this
+    point inside an axis-aligned rectangle" -- cheap enough to run inside the
+    search loop.
+    """
+    try:
+        inverse = cv2.getPerspectiveTransform(
+            np.array(img_corners, dtype=np.float32),
+            np.array(court_corners, dtype=np.float32),
+        )
+    except cv2.error:
+        return 0.0
+    left, right, near, far = lane_rect
+    back = cv2.perspectiveTransform(paint_img.reshape(-1, 1, 2), inverse).reshape(-1, 2)
+    precision = float(np.mean(
+        (back[:, 0] >= left) & (back[:, 0] <= right)
+        & (back[:, 1] >= near) & (back[:, 1] <= far)))
+
+    height, width = shape
+    forward = cv2.perspectiveTransform(lane_grid.reshape(-1, 1, 2), transform).reshape(-1, 2)
+    xs = np.clip(forward[:, 0].astype(np.int32), 0, width - 1)
+    ys = np.clip(forward[:, 1].astype(np.int32), 0, height - 1)
+    on_screen = ((forward[:, 0] >= 0) & (forward[:, 0] < width)
+                 & (forward[:, 1] >= 0) & (forward[:, 1] < height))
+    recall = float(np.mean((paint_mask[ys, xs] > 0) & on_screen))
+    if precision + recall <= 0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
 
 
 def _hull_quad(hull):
@@ -313,11 +369,15 @@ def _global_moves(corners, step):
 
 
 def _refine(img_corners, court_corners, model_points, distance, shape, step,
-            floor_area, line_cells, grid_shape, hoop_px=None, hoop_court=None):
+            floor_area, line_cells, grid_shape, hoop_px=None, hoop_court=None,
+            paint=None):
     """Search for the corner positions that best align the model's markings."""
+    paint = paint or {}
+
     def cost_of(candidate):
         return _cost(candidate, court_corners, model_points, distance, shape,
-                     floor_area, line_cells, grid_shape, hoop_px, hoop_court)
+                     floor_area, line_cells, grid_shape, hoop_px, hoop_court,
+                     **paint)
 
     corners = [list(pt) for pt in img_corners]
     best = cost_of(corners)
@@ -344,6 +404,40 @@ def _refine(img_corners, court_corners, model_points, distance, shape, step,
     return corners, best
 
 
+def _largest_paint_blob(paint_mask):
+    """The paint pixels of the single biggest painted area, subsampled.
+
+    One blob rather than all of them: a floor may also have a painted centre
+    circle or a coloured apron, and scoring the lane against those as well
+    would count a correct lane as partly wrong. The key is the largest
+    painted area on a basketball floor.
+    """
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(paint_mask, connectivity=8)
+    if count < 2:
+        return None
+    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[biggest, cv2.CC_STAT_AREA] < PAINT_MIN_PIXELS:
+        return None
+    ys, xs = np.nonzero(labels == biggest)
+    if len(xs) > 800:  # enough to locate an area; cheap enough for the inner loop
+        pick = np.linspace(0, len(xs) - 1, 800).astype(np.int32)
+        ys, xs = ys[pick], xs[pick]
+    return np.stack([xs, ys], axis=1).astype(np.float32)
+
+
+def _paint_terms(model, paint_img, paint_mask):
+    """The paint-anchor arguments for this court model, or none if no paint."""
+    if paint_img is None:
+        return None
+    left = (model.width - model.lane_width) / 2.0
+    right = (model.width + model.lane_width) / 2.0
+    grid_x, grid_y = np.meshgrid(np.linspace(left, right, 10),
+                                np.linspace(0.0, model.lane_length, 18))
+    lane_grid = np.stack([grid_x.ravel(), grid_y.ravel()], axis=1).astype(np.float32)
+    return {"paint_img": paint_img, "paint_mask": paint_mask,
+            "lane_grid": lane_grid, "lane_rect": (left, right, 0.0, model.lane_length)}
+
+
 def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
     """Best-fitting court model for this frame.
 
@@ -352,9 +446,11 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
     """
     if cv2 is None or np is None:
         raise RuntimeError("opencv-python and numpy are required.")
-    line_pixels = detect_line_pixels(frame, floor_region, floor_mask)
+    line_pixels, paint_mask = detect_line_pixels(
+        frame, floor_region, floor_mask, return_paint=True)
     if cv2.countNonZero(line_pixels) < 200:
         return None
+    paint_img = _largest_paint_blob(paint_mask)
     distance = _distance_to_lines(line_pixels)
     shape = frame.shape[:2]
 
@@ -378,6 +474,7 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
     for model in COURT_MODELS:
         model_points = model.sample_points()
         court_corners = model.corners
+        paint = _paint_terms(model, paint_img, paint_mask)
         for mirrored in (False, True):
             base = quad[::-1] if mirrored else quad
             for rotation in range(4):
@@ -393,7 +490,8 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
                              for x, y in rotated]
                     corners, cost = _refine(start, court_corners, model_points,
                                             distance, shape, step, floor_area,
-                                            line_cells, grid_shape, hoop_px, model.hoop)
+                                            line_cells, grid_shape, hoop_px, model.hoop,
+                                            paint)
                     if best is None or cost < best[0]:
                         best = (cost, corners, model, mirrored, rotation)
 
@@ -407,6 +505,7 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
     # Jittering gives the descent a way out of a shallow basin.
     cost, corners, model, mirrored, rotation = best
     model_points = model.sample_points()
+    paint = _paint_terms(model, paint_img, paint_mask)
     rng = np.random.default_rng(0)
     for attempt in range(POLISH_ATTEMPTS):
         start = [list(pt) for pt in corners]
@@ -417,7 +516,7 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
         polished, polished_cost = _refine(
             start, model.corners, model_points, distance, shape,
             shape[1] * POLISH_STEP_FRACTION, floor_area, line_cells, grid_shape,
-            hoop_px, model.hoop)
+            hoop_px, model.hoop, paint)
         if polished_cost < cost:
             cost, corners = polished_cost, polished
     # Judge acceptance on the marking distance alone. The combined score
@@ -439,5 +538,18 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
         np.array(corners, dtype=np.float32),
     )
     homography = np.linalg.inv(court_to_image)
+    # Report the paint agreement alongside the marking error. The marking
+    # error on its own can look excellent on a wrong answer -- on real
+    # multi-sport footage it read 3.0px while the lane sat in open floor --
+    # so a number that says whether the key landed on the key belongs in the
+    # result rather than only inside the search.
+    agreement = None
+    if paint is not None:
+        agreement = _paint_agreement(
+            court_to_image, model.corners, corners, paint["paint_img"],
+            paint["paint_mask"], paint["lane_grid"], paint["lane_rect"], shape)
+        if verbose:
+            print(f"[court_fit] painted key agreement: {agreement:.0%}")
     return homography, {"model": model, "cost": cost, "corners": corners,
-                        "mirrored": mirrored, "line_pixels": line_pixels}
+                        "mirrored": mirrored, "line_pixels": line_pixels,
+                        "paint_agreement": agreement}
