@@ -227,11 +227,88 @@ def check_false_hoop():
     return ok
 
 
+def check_crowd_bridge():
+    """Reproduces the real-footage failure where no key is found at all.
+
+    The lane is identified as paint ENCLOSED by wood. Players and referees
+    are non-wood, so anyone standing between the lane and the sideline forms
+    a continuous non-wood channel from the frame border into the paint --
+    the lane stops being enclosed and vanishes. On real footage somebody is
+    nearly always standing there, so this is the common case; an earlier
+    occlusion test missed it by putting players strictly INSIDE the lane,
+    where they never bridge out to the crowd.
+    """
+    court_to_img = build(CAMERAS["sideline A"])
+    _, to_img = render(court_to_img)
+
+    frame = np.full((IMG_H, IMG_W, 3), CROWD_BGR, dtype=np.uint8)
+    for poly, color in [
+        ([(-4, -4), (54, -4), (54, 51), (-4, 51)], WOOD_BGR),
+        (c.KEY_CORNERS_FT, KEY_BGR),
+    ]:
+        cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+
+    def frame_with_bridge(bridged):
+        out = frame.copy()
+        if bridged:
+            # A chain of bodies from the lane edge out past the sideline.
+            for pos in [(17, 10), (10, 10), (4, 10), (-2, 10)]:
+                base = to_img(pos)
+                cv2.rectangle(out, (int(base[0] - 40), int(base[1] - 200)),
+                              (int(base[0] + 40), int(base[1])), (40, 40, 160), -1)
+        return out
+
+    # Most frames bridged, a few clear -- which is how real footage behaves,
+    # and why the pipeline searches frames instead of trusting one.
+    tmp_path = "/tmp/courtiq_bridge_test.mp4"
+    writer = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (IMG_W, IMG_H))
+    for i in range(40):
+        writer.write(frame_with_bridge(bridged=(i % 13 != 0)))
+    writer.release()
+
+    hoop_floor = to_img((25, 5.25))
+    hoop_px = (float(hoop_floor[0]), float(hoop_floor[1]) - 120.0)
+
+    # A bridged frame must score WORSE than a clear one, or frame selection
+    # has nothing to go on.
+    bridged_score = c.detect_key_with_score(frame_with_bridge(True), hoop_px)
+    clear_score = c.detect_key_with_score(frame_with_bridge(False), hoop_px)
+    if bridged_score is None or clear_score is None:
+        print("  crowd bridge: FAIL -- lane not found at all")
+        return False
+    if not bridged_score[1] < clear_score[1] - 0.05:
+        print(f"  crowd bridge: FAIL -- bridged frame scores {bridged_score[1]:.2f}, "
+              f"clear {clear_score[1]:.2f}; selection can't tell them apart")
+        return False
+
+    found = c.detect_key_quad_from_video(tmp_path, hoop_px)
+    if found is None:
+        print("  crowd bridge: FAIL -- no lane found across the clip")
+        return False
+    H = c.key_anchored_homography(found[0], found[1])
+    if H is None:
+        print("  crowd bridge: FAIL -- lane found but calibration rejected")
+        return False
+
+    direct = mirrored = 0.0
+    for pt in CHECKS:
+        back = c.project_point(H, tuple(map(float, to_img(pt))))
+        direct = max(direct, math.hypot(back[0] - pt[0], back[1] - pt[1]))
+        mirrored = max(mirrored, math.hypot(back[0] - (50 - pt[0]), back[1] - pt[1]))
+    error = min(direct, mirrored)
+    ok = error < TOLERANCE_FT
+    print(f"  crowd bridge (players linking lane to stands): score "
+          f"{bridged_score[1]:.2f} bridged vs {clear_score[1]:.2f} clear, "
+          f"error {error:.2f} ft -- {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     print(f"Court calibration vs ground truth (tolerance {TOLERANCE_FT} ft):")
     results = [check_camera(name, pts) for name, pts in CAMERAS.items()]
     results.append(check_occlusion())
     results.append(check_false_hoop())
+    results.append(check_crowd_bridge())
     failures = results.count(False)
     print(f"\n{len(results) - failures}/{len(results)} checks pass")
     return 1 if failures else 0

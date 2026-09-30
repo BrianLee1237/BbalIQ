@@ -445,13 +445,19 @@ def order_quad_points(points) -> list:
     has the largest x-y, bottom-left the smallest).
     """
     pts = [tuple(p) for p in points]
-    sums = [p[0] + p[1] for p in pts]
-    diffs = [p[0] - p[1] for p in pts]
-    top_left = pts[sums.index(min(sums))]
-    bottom_right = pts[sums.index(max(sums))]
-    top_right = pts[diffs.index(max(diffs))]
-    bottom_left = pts[diffs.index(min(diffs))]
-    return [top_left, top_right, bottom_right, bottom_left]
+    # Order by angle around the centroid, then rotate so the corner nearest
+    # the top-left comes first. The obvious sum/difference trick (top-left is
+    # min x+y, top-right is max x-y, ...) silently breaks on a rotated quad:
+    # one corner can win two of those tests at once, so the same point gets
+    # emitted twice and the quad collapses to a triangle. Measured on a
+    # diagonal camera that produced a duplicated corner and a 355ft
+    # calibration error. Angular ordering can't duplicate a point, and agrees
+    # with the old behaviour on axis-aligned quads.
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+    ordered = sorted(pts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    start = min(range(len(ordered)), key=lambda i: ordered[i][0] + ordered[i][1])
+    return [ordered[(start + k) % len(ordered)] for k in range(len(ordered))]
 
 
 def detect_court_quad(frame) -> Optional[list]:
@@ -862,7 +868,8 @@ def refine_quad_to_painted_lines(frame, floor_mask, fallback_quad):
 KEY_CORNERS_FT = [(17.0, 0.0), (33.0, 0.0), (33.0, 19.0), (17.0, 19.0)]
 KEY_MIN_AREA_FRACTION = 0.005   # a painted region smaller than this is noise, not the key
 KEY_MAX_AREA_FRACTION = 0.30    # ...larger than this isn't the key either
-KEY_OPEN_KERNEL_FRACTION = 0.004
+FLOOR_REGION_ERODE_FRACTION = 0.008  # pull inside the floor edge so it is not read as paint
+FLOOR_PIECE_MIN_FRACTION = 0.1        # keep floor pieces this big relative to the largest
 # The lane is pinned to the baseline; paint out in open floor isn't. Measured
 # on synthetic ground truth: real lanes land at 0.05-0.15, an open-floor logo
 # at ~0.54. Sits between the two with margin on both sides rather than hugging
@@ -870,7 +877,7 @@ KEY_OPEN_KERNEL_FRACTION = 0.004
 KEY_BASELINE_EDGE_MAX_RATIO = 0.35
 
 
-def detect_painted_regions(frame) -> list:
+def detect_painted_regions(frame, floor_mask=None) -> list:
     """Find painted court areas -- regions that are NOT wood-colored but are
     fully enclosed by wood floor: the key, center-circle logos, painted lanes.
 
@@ -892,22 +899,69 @@ def detect_painted_regions(frame) -> list:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     wood = cv2.inRange(hsv, np.array(COURT_HSV_LOWER), np.array(COURT_HSV_UPPER))
 
-    inverted = (wood == 0).astype(np.uint8) * 255
-    flood_mask = np.zeros((height + 2, width + 2), np.uint8)
-    reachable = inverted.copy()
-    cv2.floodFill(reachable, flood_mask, (0, 0), 128)
-    enclosed = (reachable == 255).astype(np.uint8) * 255
+    non_wood = (wood == 0).astype(np.uint8) * 255
 
-    open_k = _odd_kernel(width * KEY_OPEN_KERNEL_FRACTION)
-    enclosed = cv2.morphologyEx(enclosed, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8))
-    contours, _ = cv2.findContours(enclosed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Exclude the crowd GEOMETRICALLY, by keeping only what lies inside the
+    # detected floor boundary. The earlier approach -- paint is non-wood
+    # "enclosed" by wood -- is fragile in exactly the situation that occurs
+    # constantly in real footage: players, referees and shadows are all
+    # non-wood, so anyone standing between the lane and the sideline forms a
+    # continuous non-wood channel from the frame border into the paint. The
+    # lane stops being enclosed and is never found at all. Severing those
+    # bridges morphologically needs a kernel wider than a player, which
+    # rounds the lane's corners and leaves a spur that drags the quad fit
+    # (measured: 0.3-7ft of error depending on kernel).
+    #
+    # Restricting to the floor polygon sidesteps connectivity entirely: the
+    # crowd is outside it no matter what is standing in the way.
+    # Use the floor's ACTUAL outline, not its four-corner approximation: that
+    # approximation is a bounding quad, so on an angled view it reaches past
+    # the floor into the crowd at the corners, and those crowd chunks then
+    # read as painted regions. Filling the wood mask's outer contour follows
+    # the real floor shape and takes the paint with it, since the paint is a
+    # hole inside that contour. Players bridging out to the crowd don't
+    # matter here -- they're not wood, so they were never part of this
+    # contour to begin with.
+    if floor_mask is None:
+        floor_mask = court_quad_debug(frame).get("morphed_color_mask")
+    if floor_mask is None:
+        return []
+    floor_contours, _ = cv2.findContours(floor_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not floor_contours:
+        return []
+    # Take the CONVEX HULL of the substantial floor pieces, rather than
+    # filling their contours. Two things break a plain fill: a line of
+    # players cuts the wood into separate pieces, and -- worse -- a player
+    # standing between the lane and the sideline carves a channel joining the
+    # lane to the outside, so the lane stops being an interior hole and a
+    # filled contour excludes it completely (measured: the lane's pixels drop
+    # out entirely and no paint is found at all).
+    #
+    # A hull spans both the gaps and the channel. It's safe here because a
+    # court floor is convex -- the hull of a trapezoidal floor is that same
+    # trapezoid, so this doesn't reach into the crowd the way the floor's
+    # four-corner BOUNDING quad does on an angled view.
+    largest_floor_area = max(cv2.contourArea(fc) for fc in floor_contours)
+    significant = [fc for fc in floor_contours
+                   if cv2.contourArea(fc) >= largest_floor_area * FLOOR_PIECE_MIN_FRACTION]
+    floor_region = np.zeros((height, width), np.uint8)
+    cv2.fillPoly(floor_region, [cv2.convexHull(np.vstack(significant))], 255)
+    # Pull in slightly so the floor's own outer edge isn't read as paint.
+    erode_k = _odd_kernel(width * FLOOR_REGION_ERODE_FRACTION)
+    floor_region = cv2.erode(floor_region, np.ones((erode_k, erode_k), np.uint8))
+    non_wood = cv2.bitwise_and(non_wood, floor_region)
 
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(non_wood, connectivity=8)
     frame_area = float(height * width)
     keep = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if KEY_MIN_AREA_FRACTION * frame_area <= area <= KEY_MAX_AREA_FRACTION * frame_area:
-            keep.append(contour)
+    for label in range(1, count):
+        area = stats[label][4]
+        if not (KEY_MIN_AREA_FRACTION * frame_area <= area <= KEY_MAX_AREA_FRACTION * frame_area):
+            continue
+        component = (labels == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            keep.append(max(contours, key=cv2.contourArea))
     return keep
 
 
