@@ -177,6 +177,21 @@ def find_axes(segments, line_width_px):
         if best is None:
             break
         weight, vp, inl = best
+        # Refit over every inlier rather than keeping the two-segment estimate
+        # the sample happened to give. Two nearly parallel segments put their
+        # intersection almost anywhere -- measured, an axis carrying only five
+        # segments landed its vanishing point on the frame's corner, which
+        # says the court recedes to nothing within the picture and collapsed
+        # the fit to a sliver. Every inlier together is far better posed.
+        for _ in range(3):
+            refined = _least_squares_vp(lines[inl], lengths[inl])
+            if refined is None:
+                break
+            grown = inliers_of(refined, available | set(inl))
+            if len(grown) < 3:
+                break
+            vp, inl = refined, grown
+        weight = float(lengths[inl].sum())
         axes.append({"vp": vp / np.linalg.norm(vp), "segments": inl, "weight": weight})
         available -= set(inl)
 
@@ -185,6 +200,30 @@ def find_axes(segments, line_width_px):
     if _axis_separation_deg(axes[0], axes[1], mids) < MIN_AXIS_SEPARATION_DEG:
         return None
     return axes
+
+
+def _least_squares_vp(inlier_lines, weights):
+    """The point lying closest to all of these lines at once.
+
+    A vanishing point is on every line of its pencil, so it is the null
+    vector of their stacked coefficients. Longer segments locate their line
+    better, so they are weighted accordingly. Taken as the smallest singular
+    vector, which is the least-squares answer when the lines don't meet
+    exactly -- and they never do.
+    """
+    if len(inlier_lines) < 2:
+        return None
+    scale = np.maximum(np.hypot(inlier_lines[:, 0], inlier_lines[:, 1]), 1e-9)
+    normalised = inlier_lines / scale[:, None]
+    weighted = normalised * np.sqrt(np.maximum(weights, 1e-9))[:, None]
+    try:
+        _, _, vt = np.linalg.svd(weighted)
+    except np.linalg.LinAlgError:
+        return None
+    vp = vt[-1]
+    if not np.isfinite(vp).all() or np.allclose(vp, 0.0):
+        return None
+    return vp
 
 
 def _axis_separation_deg(first, second, mids):

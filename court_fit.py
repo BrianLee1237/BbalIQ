@@ -71,6 +71,11 @@ COVERAGE_WEIGHT = 25.0
 # sport. Measured on real footage: a 3.0px marking error with the lane sitting
 # in open floor and the arc curving the wrong way.
 HOOP_WEIGHT = 90.0
+HOOP_HEIGHT_FT = 10.0            # a basketball rim, by the rules of the game
+# Turns the rim miss in feet into a penalty: at this many feet out, the rim
+# term costs HOOP_WEIGHT. Set to about the lane's width, so landing the hoop
+# a lane away from the rim is already a decisive objection.
+HOOP_ERROR_SCALE_FT = 12.0
 
 # The filled painted key, matched by overlap. Lines alone cannot say WHERE on
 # a multi-sport floor the basketball court is, because volleyball, badminton
@@ -277,13 +282,28 @@ def _cost(img_corners, court_corners, model_points, distance, shape,
         projected_hoop = cv2.perspectiveTransform(
             np.array([[[hoop_court[0], hoop_court[1]]]], dtype=np.float32), transform
         )[0][0]
-        # Across-frame position should match the rim's. The rim is 10ft up so
-        # it sits ABOVE its floor point in the image, which constrains the
-        # vertical ordering but not the distance -- that depends on camera
-        # height, which we don't know.
-        across = abs(float(projected_hoop[0]) - hoop_px[0]) / max(1.0, width)
-        wrong_side = max(0.0, hoop_px[1] - float(projected_hoop[1])) / max(1.0, height)
-        total += HOOP_WEIGHT * (across + wrong_side)
+        # The rim is 10ft above its floor point, so in the image it sits
+        # above that point by roughly ten times whatever a foot is worth
+        # there. Measure the gap against that, in feet, rather than only
+        # checking the rim is somewhere above: a court laid at right angles
+        # to the true one put its hoop 600px below the rim at the same x,
+        # which scored zero on both an across-frame test and an ordering
+        # test and so was never penalised at all.
+        #
+        # The scale comes from the hypothesis itself -- how far apart a foot
+        # of court lands near the hoop -- so this holds at any resolution or
+        # camera distance.
+        neighbour = cv2.perspectiveTransform(
+            np.array([[[hoop_court[0], hoop_court[1] + 1.0]]], dtype=np.float32), transform
+        )[0][0]
+        px_per_ft = max(1e-6, float(np.hypot(neighbour[0] - projected_hoop[0],
+                                             neighbour[1] - projected_hoop[1])))
+        gap_x = (float(projected_hoop[0]) - hoop_px[0]) / px_per_ft
+        gap_y = (float(projected_hoop[1]) - hoop_px[1]) / px_per_ft
+        # Sideways the rim should be right over its floor point; vertically
+        # it should be about a rim's height above it.
+        error_ft = math.hypot(gap_x, gap_y - HOOP_HEIGHT_FT)
+        total += HOOP_WEIGHT * (error_ft / HOOP_ERROR_SCALE_FT)
 
     if paint_img is not None and lane_grid is not None:
         total += PAINT_WEIGHT * (1.0 - _paint_agreement(
@@ -496,6 +516,70 @@ def _paint_terms(model, paint_img, paint_mask):
             "lane_grid": lane_grid, "lane_rect": (left, right, 0.0, model.lane_length)}
 
 
+def _fit_on_axes(frame, floor_region, line_pixels, shape, distance, floor_area,
+                 line_cells, grid_shape, hoop_px, paint_img, paint_mask, verbose):
+    """Fit with the court's orientation taken from its vanishing points.
+
+    Returns the same (homography, info) as fit_court, or None when the axes
+    can't be found or the result doesn't line up with the markings -- in
+    which case the caller falls back to the free-corner search.
+    """
+    import court_axes
+    import court_axes_fit
+
+    segments, line_width = court_axes.detect_segments(line_pixels, floor_region)
+    axes = court_axes.find_axes(segments, line_width)
+    if axes is None:
+        if verbose:
+            print("[court_fit] could not find two court axes; "
+                  "falling back to searching the corners.")
+        return None
+    if verbose:
+        print(f"[court_fit] court axes from {len(axes[0]['segments'])}"
+              f"+{len(axes[1]['segments'])} of {len(segments)} line segments.")
+
+    def cost_of(corners, model):
+        paint = _paint_terms(model, paint_img, paint_mask) or {}
+        return _cost(corners, model.corners, model.sample_points(), distance,
+                     shape, floor_area, line_cells, grid_shape,
+                     hoop_px, model.hoop, **paint)
+
+    result = court_axes_fit.fit_on_axes(COURT_MODELS, axes, floor_region, shape,
+                                        cost_of, verbose=verbose)
+    if result is None:
+        return None
+
+    model, corners = result["model"], result["corners"]
+    # Judge acceptance on the marking distance alone, as the free-corner
+    # search does: the combined score carries search-only penalties.
+    cost = _cost(corners, model.corners, model.sample_points(), distance,
+                 shape, floor_area)
+    if verbose:
+        print(f"[court_fit] axis-locked fit: {model.name} court, "
+              f"mean marking error {cost:.1f}px")
+    if cost > MAX_COST_PX:
+        if verbose:
+            print(f"[court_fit] axis-locked fit rejected ({cost:.1f}px > "
+                  f"{MAX_COST_PX}px); falling back to searching the corners.")
+        return None
+
+    court_to_image = cv2.getPerspectiveTransform(
+        np.array(model.corners, dtype=np.float32),
+        np.array(corners, dtype=np.float32),
+    )
+    agreement = None
+    paint = _paint_terms(model, paint_img, paint_mask)
+    if paint is not None:
+        agreement = _paint_agreement(
+            court_to_image, model.corners, corners, paint["paint_img"],
+            paint["paint_mask"], paint["lane_grid"], paint["lane_rect"], shape)
+    return np.linalg.inv(court_to_image), {
+        "model": model, "cost": cost, "corners": corners, "mirrored": False,
+        "line_pixels": line_pixels, "paint_agreement": agreement,
+        "from_axes": True,
+    }
+
+
 def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
     """Best-fitting court model for this frame.
 
@@ -530,6 +614,17 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
         (line_ys / COVERAGE_CELL_PX).astype(np.int32) * cols
         + (line_xs / COVERAGE_CELL_PX).astype(np.int32)
     )
+    # Prefer a fit locked to the court's own axes. Those are fixed by every
+    # long line in the picture, and they leave four parameters to settle
+    # instead of eight -- which matters most on exactly the footage the
+    # free-corner search cannot handle, where the court's corners are outside
+    # the frame and there is nothing to start those eight from.
+    axed = _fit_on_axes(frame, floor_region, line_pixels, shape, distance,
+                        floor_area, line_cells, grid_shape, hoop_px,
+                        paint_img, paint_mask, verbose)
+    if axed is not None:
+        return axed
+
     step = shape[1] * REFINE_START_FRACTION
     best = None
     for model in COURT_MODELS:
