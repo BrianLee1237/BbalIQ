@@ -614,17 +614,6 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
         (line_ys / COVERAGE_CELL_PX).astype(np.int32) * cols
         + (line_xs / COVERAGE_CELL_PX).astype(np.int32)
     )
-    # Prefer a fit locked to the court's own axes. Those are fixed by every
-    # long line in the picture, and they leave four parameters to settle
-    # instead of eight -- which matters most on exactly the footage the
-    # free-corner search cannot handle, where the court's corners are outside
-    # the frame and there is nothing to start those eight from.
-    axed = _fit_on_axes(frame, floor_region, line_pixels, shape, distance,
-                        floor_area, line_cells, grid_shape, hoop_px,
-                        paint_img, paint_mask, verbose)
-    if axed is not None:
-        return axed
-
     step = shape[1] * REFINE_START_FRACTION
     best = None
     for model in COURT_MODELS:
@@ -687,7 +676,19 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
         if verbose:
             print(f"[court_fit] rejecting: {cost:.1f}px exceeds the {MAX_COST_PX}px limit, "
                   f"so the model never actually lined up with the markings.")
-        return None
+        # Only now try the axis-locked fit. It is the better-posed search --
+        # four parameters against eight, and no need for the court's corners
+        # to be in frame -- but it cannot yet be trusted ahead of this one:
+        # run first, it turned a camera that had been landing within 0.4ft
+        # into a 91ft miss that still scored 11.3px and so was accepted.
+        # Repeated parallel markings let a court scaled along one axis land
+        # its lines on every other real line, and the marking distance
+        # cannot tell that apart from the truth. Until something can, this
+        # stays where it can only help: after the free-corner search has
+        # given up.
+        return _fit_on_axes(frame, floor_region, line_pixels, shape, distance,
+                            floor_area, line_cells, grid_shape, hoop_px,
+                            paint_img, paint_mask, verbose)
 
     court_to_image = cv2.getPerspectiveTransform(
         np.array(model.corners, dtype=np.float32),
