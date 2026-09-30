@@ -934,12 +934,101 @@ def detect_key_quad(frame, hoop_px) -> Optional[list]:
     if best is None:
         return None
 
-    peri = cv2.arcLength(best, True)
-    approx = cv2.approxPolyDP(best, 0.02 * peri, True)
+    return _key_quad_from_contour(best)[0]
+
+
+def _key_quad_from_contour(contour):
+    """Fit a quad to a painted-region contour, and score how rectangular
+    that contour actually was.
+
+    The score compares the CONTOUR's own area against the fitted QUAD's
+    area. An unobstructed lane fills its quad (~1.0); a player standing in
+    the paint bites a chunk out of the painted region, so the contour comes
+    up well short of the quad that gets fitted around it. Comparing the
+    quad against itself -- which is easy to do by accident -- always yields
+    exactly 1.0 and silently makes the score useless.
+    """
+    peri = cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
     if len(approx) != 4:
-        rect = cv2.minAreaRect(best)
+        rect = cv2.minAreaRect(contour)
         approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
-    return order_quad_points(approx.reshape(-1, 2).astype(float))
+    quad = order_quad_points(approx.reshape(-1, 2).astype(float))
+
+    quad_area = abs(_signed_area(quad))
+    contour_area = float(cv2.contourArea(contour))
+    rectangularity = (min(contour_area, quad_area) / max(contour_area, quad_area)
+                      if max(contour_area, quad_area) > 0 else 0.0)
+    return quad, rectangularity
+
+
+def detect_key_with_score(frame, hoop_px):
+    """detect_key_quad(), but also reporting how unobstructed the lane was.
+    Returns (quad, rectangularity) or None."""
+    contours = detect_painted_regions(frame)
+    if not contours:
+        return None
+    best, best_dist = None, None
+    for contour in contours:
+        moments = cv2.moments(contour)
+        if moments["m00"] == 0:
+            continue
+        cx = moments["m10"] / moments["m00"]
+        cy = moments["m01"] / moments["m00"]
+        dist = math.hypot(cx - hoop_px[0], cy - hoop_px[1])
+        if best_dist is None or dist < best_dist:
+            best, best_dist = contour, dist
+    if best is None:
+        return None
+    return _key_quad_from_contour(best)
+
+
+KEY_SAMPLE_FRAMES = int(os.environ.get("COURTIQ_KEY_SAMPLE_FRAMES", "40"))
+
+
+def detect_key_quad_from_video(video_path: str, hoop_px) -> Optional[tuple]:
+    """Find the painted key using the whole video rather than one frame.
+
+    On a single frame players are routinely standing in the paint, which
+    cuts the painted region into pieces and yields a fragmented, non-
+    rectangular quad. Across a clip, though, some frames have a clear or
+    nearly-clear lane. So sample frames, and keep whichever detection is
+    most rectangular -- the ratio of the contour's own area to its fitted
+    quad's area, which is ~1.0 for an unobstructed lane and drops sharply
+    once a player bites a chunk out of it.
+
+    Returns (key_quad, floor_mask) from the best frame, or None.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    capture = cv2.VideoCapture(video_path)
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if frame_count <= 0:
+        capture.release()
+        return None
+    step = max(1, frame_count // KEY_SAMPLE_FRAMES)
+
+    best = None  # (rectangularity, key_quad, floor_mask)
+    for frame_idx in range(0, frame_count, step):
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = capture.read()
+        if not ok:
+            break
+        scored = detect_key_with_score(frame, hoop_px)
+        if scored is None:
+            continue
+        key_quad, rectangularity = scored
+        if best is None or rectangularity > best[0]:
+            floor_mask = court_quad_debug(frame).get("morphed_color_mask")
+            if floor_mask is not None:
+                best = (rectangularity, key_quad, floor_mask)
+    capture.release()
+
+    if best is None:
+        return None
+    print(f"[courtiq_core] Painted key found (rectangularity {best[0]:.2f}) from the "
+          f"clearest of {KEY_SAMPLE_FRAMES} sampled frames.")
+    return best[1], best[2]
 
 
 def _signed_area(points) -> float:
@@ -1137,18 +1226,17 @@ def auto_homography(video_path: str) -> "np.ndarray":
         # KNOWN real size (16x19ft), unlike the wood-floor outline, which
         # includes however much out-of-bounds apron the gym happens to have
         # and so gets the scale wrong even when its shape looks right.
-        key_quad = detect_key_quad(frame, hoop_px)
-        if key_quad is not None:
-            floor_mask = court_quad_debug(frame).get("morphed_color_mask")
-            if floor_mask is not None:
-                key_homography = key_anchored_homography(key_quad, floor_mask)
-                if key_homography is not None:
-                    hoop_ft = project_point(key_homography, hoop_px)
-                    print(f"[courtiq_core] Calibrated from the painted key. Hoop projects to "
-                          f"({hoop_ft[0]:.1f}, {hoop_ft[1]:.1f}) ft (a real hoop is at "
-                          f"{COURT_LANDMARKS['hoop']}; expect several ft of offset since the rim "
-                          f"is 10ft above the floor plane this maps).")
-                    return key_homography
+        found = detect_key_quad_from_video(video_path, hoop_px)
+        if found is not None:
+            key_quad, floor_mask = found
+            key_homography = key_anchored_homography(key_quad, floor_mask)
+            if key_homography is not None:
+                hoop_ft = project_point(key_homography, hoop_px)
+                print(f"[courtiq_core] Calibrated from the painted key. Hoop projects to "
+                      f"({hoop_ft[0]:.1f}, {hoop_ft[1]:.1f}) ft (a real hoop is at "
+                      f"{COURT_LANDMARKS['hoop']}; expect several ft of offset since the rim "
+                      f"is 10ft above the floor plane this maps).")
+                return key_homography
 
         # Fallback: the floor outline, at least oriented correctly by the hoop.
         oriented = orient_quad_with_hoop(quad, hoop_px)

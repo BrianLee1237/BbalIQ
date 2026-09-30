@@ -106,11 +106,76 @@ def check_camera(name, img_points):
     return ok
 
 
+def check_occlusion(tmp_path="/tmp/courtiq_occlusion_test.mp4"):
+    """Players stand in the paint constantly, so most frames show a lane
+    with a chunk bitten out of it. Build a clip that's mostly occluded and
+    check the multi-frame search still finds a clean view to calibrate off.
+    """
+    court_to_img = build(CAMERAS["sideline A"])
+    _, to_img = render(court_to_img)
+
+    def frame_with(occluded):
+        frame = np.full((IMG_H, IMG_W, 3), CROWD_BGR, dtype=np.uint8)
+        for poly, color in [
+            ([(-4, -4), (54, -4), (54, 51), (-4, 51)], WOOD_BGR),
+            (c.KEY_CORNERS_FT, KEY_BGR),
+        ]:
+            cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+        if occluded:
+            for pos in [(20, 4), (30, 8), (25, 14), (21, 17)]:
+                base = to_img(pos)
+                cv2.rectangle(frame, (int(base[0] - 45), int(base[1] - 190)),
+                              (int(base[0] + 45), int(base[1])), (40, 40, 160), -1)
+        return frame
+
+    writer = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (IMG_W, IMG_H))
+    for i in range(40):
+        writer.write(frame_with(occluded=(i % 13 != 0)))
+    writer.release()
+
+    hoop_floor = to_img((25, 5.25))
+    hoop_px = (float(hoop_floor[0]), float(hoop_floor[1]) - 120.0)
+
+    occluded_score = c.detect_key_with_score(frame_with(True), hoop_px)
+    clear_score = c.detect_key_with_score(frame_with(False), hoop_px)
+    if occluded_score is None or clear_score is None:
+        print("  occlusion: FAIL -- key not detected")
+        return False
+    # The score has to actually separate the two cases. Comparing a fitted
+    # quad against itself yields exactly 1.0 for everything, which looks
+    # like it's working while ranking frames arbitrarily.
+    if not occluded_score[1] < clear_score[1] - 0.05:
+        print(f"  occlusion: FAIL -- score does not distinguish occluded "
+              f"({occluded_score[1]:.2f}) from clear ({clear_score[1]:.2f})")
+        return False
+
+    found = c.detect_key_quad_from_video(tmp_path, hoop_px)
+    if found is None:
+        print("  occlusion: FAIL -- no key found across the clip")
+        return False
+    H = c.key_anchored_homography(found[0], found[1])
+    if H is None:
+        print("  occlusion: FAIL -- calibration failed")
+        return False
+
+    direct = mirrored = 0.0
+    for pt in CHECKS:
+        back = c.project_point(H, tuple(map(float, to_img(pt))))
+        direct = max(direct, math.hypot(back[0] - pt[0], back[1] - pt[1]))
+        mirrored = max(mirrored, math.hypot(back[0] - (50 - pt[0]), back[1] - pt[1]))
+    error = min(direct, mirrored)
+    ok = error < TOLERANCE_FT
+    print(f"  occlusion (36/40 frames blocked): score {occluded_score[1]:.2f} occluded vs "
+          f"{clear_score[1]:.2f} clear, error {error:.2f} ft -- {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     print(f"Court calibration vs ground truth (tolerance {TOLERANCE_FT} ft):")
     results = [check_camera(name, pts) for name, pts in CAMERAS.items()]
+    results.append(check_occlusion())
     failures = results.count(False)
-    print(f"\n{len(results) - failures}/{len(results)} cameras pass")
+    print(f"\n{len(results) - failures}/{len(results)} checks pass")
     return 1 if failures else 0
 
 
