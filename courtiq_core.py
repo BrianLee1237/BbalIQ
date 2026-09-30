@@ -1537,7 +1537,15 @@ def auto_homography(video_path: str) -> "np.ndarray":
                     # several sports' markings, and a basketball model can land
                     # its lines neatly on somebody else's and still be in the
                     # wrong place; the rim says where the court actually is.
-                    rim = detect_hoop(video_path)
+                    # The rim is an optional aid, so a missing or failed
+                    # detector must not take calibration down with it: the fit
+                    # works from the markings alone, just with less to go on.
+                    try:
+                        rim = detect_hoop(video_path)
+                    except Exception as exc:
+                        print(f"[courtiq_core] No rim to anchor the fit ({exc}); "
+                              f"calibrating from the markings alone.")
+                        rim = None
                     fitted = court_fit.fit_court(median, line_floor_region, line_floor_mask,
                                                  hoop_px=rim)
                     if fitted is not None:
