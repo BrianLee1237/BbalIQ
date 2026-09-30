@@ -3,3 +3,6 @@ work/
 __pycache__/
 *.pyc
 yolo11n.pt
+
+# Diagnostic images, rewritten on every run of the debug scripts.
+court_fit_*.png
