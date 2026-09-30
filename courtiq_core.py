@@ -1000,8 +1000,11 @@ def refine_quad_to_painted_lines(frame, floor_mask, fallback_quad):
 # The painted key ("the paint"), as court coordinates, in cyclic order
 # starting from the baseline edge. 16ft wide, 19ft from the baseline.
 KEY_CORNERS_FT = [(17.0, 0.0), (33.0, 0.0), (33.0, 19.0), (17.0, 19.0)]
-KEY_MIN_AREA_FRACTION = 0.005   # a painted region smaller than this is noise, not the key
-KEY_MAX_AREA_FRACTION = 0.30    # ...larger than this isn't the key either
+# The lane as a share of the VISIBLE FLOOR: 16x19ft of a ~2400sqft half court
+# is about a tenth, and that ratio survives any zoom or framing, unlike a
+# share of the frame.
+KEY_MIN_FLOOR_FRACTION = 0.03
+KEY_MAX_FLOOR_FRACTION = 0.30
 FLOOR_REGION_ERODE_FRACTION = 0.008  # pull inside the floor edge so it is not read as paint
 FLOOR_PIECE_MIN_FRACTION = 0.1        # keep floor pieces this big relative to the largest
 PAINT_LINE_KERNEL_FRACTION = 0.006   # wider than a court line, far narrower than the lane.
@@ -1063,26 +1066,9 @@ def detect_painted_regions(frame, floor_mask=None) -> list:
         floor_mask = court_quad_debug(frame).get("morphed_color_mask")
     if floor_mask is None:
         return []
-    floor_contours, _ = cv2.findContours(floor_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not floor_contours:
+    floor_region = floor_hull_region(floor_mask)
+    if floor_region is None:
         return []
-    # Take the CONVEX HULL of the substantial floor pieces, rather than
-    # filling their contours. Two things break a plain fill: a line of
-    # players cuts the wood into separate pieces, and -- worse -- a player
-    # standing between the lane and the sideline carves a channel joining the
-    # lane to the outside, so the lane stops being an interior hole and a
-    # filled contour excludes it completely (measured: the lane's pixels drop
-    # out entirely and no paint is found at all).
-    #
-    # A hull spans both the gaps and the channel. It's safe here because a
-    # court floor is convex -- the hull of a trapezoidal floor is that same
-    # trapezoid, so this doesn't reach into the crowd the way the floor's
-    # four-corner BOUNDING quad does on an angled view.
-    largest_floor_area = max(cv2.contourArea(fc) for fc in floor_contours)
-    significant = [fc for fc in floor_contours
-                   if cv2.contourArea(fc) >= largest_floor_area * FLOOR_PIECE_MIN_FRACTION]
-    floor_region = np.zeros((height, width), np.uint8)
-    cv2.fillPoly(floor_region, [cv2.convexHull(np.vstack(significant))], 255)
     # Pull in slightly so the floor's own outer edge isn't read as paint.
     erode_k = _odd_kernel(width * FLOOR_REGION_ERODE_FRACTION)
     floor_region = cv2.erode(floor_region, np.ones((erode_k, erode_k), np.uint8))
@@ -1105,8 +1091,19 @@ def detect_painted_regions(frame, floor_mask=None) -> list:
     line_kernel = np.ones((line_k, line_k), np.uint8)
     seeds = cv2.morphologyEx(non_wood, cv2.MORPH_OPEN, line_kernel)
 
+    # Size the lane against the FLOOR, not the frame. The lane is 16x19ft out
+    # of a ~2400sqft half court, so it's always roughly a tenth of the visible
+    # floor -- a ratio that holds whatever the camera's zoom or framing.
+    # Measured against the frame instead, the filter admitted a referee, a
+    # scoreboard, a centre-court logo and a spectator, all 1-4% of the floor,
+    # and one of them got picked as the lane.
+    floor_area = float(cv2.countNonZero(floor_region))
+    if floor_area <= 0:
+        return []
+    min_area = floor_area * KEY_MIN_FLOOR_FRACTION
+    max_area = floor_area * KEY_MAX_FLOOR_FRACTION
+
     count, labels, stats, _ = cv2.connectedComponentsWithStats(seeds, connectivity=8)
-    frame_area = float(height * width)
     keep = []
     for label in range(1, count):
         if stats[label][4] <= 0:
@@ -1122,7 +1119,7 @@ def detect_painted_regions(frame, floor_mask=None) -> list:
             continue
         contour = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(contour)
-        if KEY_MIN_AREA_FRACTION * frame_area <= area <= KEY_MAX_AREA_FRACTION * frame_area:
+        if min_area <= area <= max_area:
             keep.append(contour)
     return keep
 
@@ -1292,6 +1289,26 @@ def _signed_area(points) -> float:
     return total / 2.0
 
 
+def floor_hull_region(floor_mask) -> Optional["np.ndarray"]:
+    """Filled convex hull of the floor's substantial pieces.
+
+    Used both to bound the search for paint and to measure how far the floor
+    continues past each edge of the lane. A hull rather than the raw mask
+    because the mask is riddled with holes -- every painted line, player and
+    shadow -- and those holes otherwise read as "the floor ends here".
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    contours, _ = cv2.findContours(floor_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    largest = max(cv2.contourArea(fc) for fc in contours)
+    significant = [fc for fc in contours if cv2.contourArea(fc) >= largest * FLOOR_PIECE_MIN_FRACTION]
+    region = np.zeros(floor_mask.shape[:2], np.uint8)
+    cv2.fillPoly(region, [cv2.convexHull(np.vstack(significant))], 255)
+    return region
+
+
 def _floor_extent_beyond_edge(floor_mask, centroid, edge_midpoint) -> float:
     """March outward from an edge of the key, away from its centre, and
     measure how far the wood floor continues before it runs out.
@@ -1301,6 +1318,11 @@ def _floor_extent_beyond_edge(floor_mask, centroid, edge_midpoint) -> float:
     before the floor ends at the crowd, while past the free-throw line the
     floor runs on for the rest of the court. Purely a floor measurement, so
     unlike every rim-geometry shortcut it is immune to the rim's elevation.
+
+    Takes the floor REGION (a filled hull), not the raw colour mask. The lane
+    is bordered by its own painted lines, so against the raw mask the march
+    stops on the very first pixel outside the lane and every edge measures
+    ~0 -- which silently picked the wrong edge as the baseline.
     """
     height, width = floor_mask.shape
     dx = edge_midpoint[0] - centroid[0]
@@ -1340,11 +1362,14 @@ def key_anchored_homography(key_quad, floor_mask) -> Optional["np.ndarray"]:
         sum(p[0] for p in key_quad) / 4.0,
         sum(p[1] for p in key_quad) / 4.0,
     )
+    floor_region = floor_hull_region(floor_mask)
+    if floor_region is None:
+        return None
     extents = []
     for i in range(4):
         a, b = key_quad[i], key_quad[(i + 1) % 4]
         midpoint = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
-        extents.append(_floor_extent_beyond_edge(floor_mask, centroid, midpoint))
+        extents.append(_floor_extent_beyond_edge(floor_region, centroid, midpoint))
     baseline_edge = int(min(range(4), key=lambda i: extents[i]))
     opposite_edge = (baseline_edge + 2) % 4
     print(f"[courtiq_core] Floor extent beyond each key edge (px): "

@@ -395,6 +395,55 @@ def check_floor_colors():
     return all_ok
 
 
+def check_distractors():
+    """Small non-floor things must not be mistaken for the lane.
+
+    Real footage is full of them: a referee, a scoreboard overlay, a
+    centre-court logo, a bench of substitutes, a spectator leaning in. Each
+    reads as a painted region, and on real footage a REFEREE was chosen as
+    the lane -- so the filter has to know a lane's real size relative to the
+    floor rather than just "not tiny".
+    """
+    court_to_img = build(CAMERAS["sideline A"])
+    frame, to_img = render(court_to_img)
+
+    # Referee, mid-court logo, scoreboard overlay, bench along the sideline.
+    ref = to_img((8, 25))
+    cv2.rectangle(frame, (int(ref[0] - 35), int(ref[1] - 190)),
+                  (int(ref[0] + 35), int(ref[1])), (55, 55, 55), -1)
+    cv2.fillPoly(frame, [np.array([to_img(p) for p in
+                                   [(20, 26), (30, 26), (30, 33), (20, 33)]], dtype=np.int32)],
+                 (60, 45, 90))
+    cv2.rectangle(frame, (30, IMG_H - 190), (330, IMG_H - 20), (35, 35, 35), -1)
+    for i in range(6):
+        seat = to_img((52, 8 + i * 5))
+        cv2.rectangle(frame, (int(seat[0] - 30), int(seat[1] - 150)),
+                      (int(seat[0] + 30), int(seat[1])), (50, 40, 90), -1)
+
+    hoop_floor = to_img((25, 5.25))
+    hoop_px = (float(hoop_floor[0]), float(hoop_floor[1]) - 120.0)
+
+    regions = c.detect_painted_regions(frame)
+    scored = c.detect_key_with_score(frame, hoop_px)
+    floor_mask = c.court_quad_debug(frame).get("morphed_color_mask")
+    H = (c.key_anchored_homography(scored[0], floor_mask)
+         if scored is not None and floor_mask is not None else None)
+    if H is None:
+        print(f"  distractors: FAIL -- no calibration ({len(regions)} regions)")
+        return False
+
+    direct = mirrored = 0.0
+    for pt in CHECKS:
+        back = c.project_point(H, tuple(map(float, to_img(pt))))
+        direct = max(direct, math.hypot(back[0] - pt[0], back[1] - pt[1]))
+        mirrored = max(mirrored, math.hypot(back[0] - (50 - pt[0]), back[1] - pt[1]))
+    error = min(direct, mirrored)
+    ok = error < TOLERANCE_FT
+    print(f"  distractors (ref/logo/scoreboard/bench): {len(regions)} regions kept, "
+          f"error {error:.2f} ft -- {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     print(f"Court calibration vs ground truth (tolerance {TOLERANCE_FT} ft):")
     results = [check_camera(name, pts) for name, pts in CAMERAS.items()]
@@ -402,6 +451,7 @@ def main():
     results.append(check_false_hoop())
     results.append(check_crowd_bridge())
     results.append(check_floor_colors())
+    results.append(check_distractors())
     failures = results.count(False)
     print(f"\n{len(results) - failures}/{len(results)} checks pass")
     return 1 if failures else 0
