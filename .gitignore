@@ -3,3 +3,10 @@ work/
 __pycache__/
 *.pyc
 yolo11n.pt
+
+# Diagnostic images, rewritten on every run of the debug scripts.
+court_fit_*.png
+
+# Model weights. Large binaries that belong in a release, not in history --
+# basketball_ball.pt alone is 165MB, past GitHub's per-file limit.
+models/
