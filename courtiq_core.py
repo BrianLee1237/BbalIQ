@@ -1514,6 +1514,35 @@ def auto_homography(video_path: str) -> "np.ndarray":
         "using it for homography without manual clicking. This is a heuristic, not a "
         "guarantee; pass --interactive if results look off."
     )
+    # Preferred: fit the court's LINE MARKINGS. Every court has them, in
+    # standardised positions, which is not true of a cleanly-painted lane --
+    # measured on real footage the largest painted region scored 0.38
+    # rectangularity, an irregular decorative area that merged the lane with
+    # a wordmark, so lane-based calibration had nothing to work with.
+    #
+    # Fitted against a median frame rather than any single one: the court
+    # never moves and the players never stop, so the median is essentially
+    # the empty court, which removes the occlusion that otherwise roughens
+    # the fit badly.
+    try:
+        import court_fit
+
+        median = court_fit.median_frame(video_path)
+        if median is not None:
+            line_floor_mask = court_quad_debug(median).get("morphed_color_mask")
+            if line_floor_mask is not None:
+                line_floor_region = floor_hull_region(line_floor_mask)
+                if line_floor_region is not None:
+                    fitted = court_fit.fit_court(median, line_floor_region, line_floor_mask)
+                    if fitted is not None:
+                        homography, info = fitted
+                        print(f"[courtiq_core] Calibrated from court line markings "
+                              f"({info['model'].name} dimensions, {info['cost']:.1f}px mean "
+                              f"marking error).")
+                        return homography
+    except ImportError:
+        pass
+
     # Calibrate from the painted key: a rectangle of KNOWN real size
     # (16x19ft), unlike the wood-floor outline, which includes however much
     # out-of-bounds apron the gym happens to have and so gets the scale
