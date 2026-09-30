@@ -81,7 +81,12 @@ HOOP_WEIGHT = 90.0
 # court from a college one -- are all pinned by it. Weighted above the
 # markings term because it is the more trustworthy evidence of the two.
 PAINT_WEIGHT = 120.0
-PAINT_MIN_PIXELS = 400
+KEY_MIN_FLOOR_FRACTION = 0.01   # measured: the key runs 6.6-8.8% of the floor
+KEY_MAX_FLOOR_FRACTION = 0.15   # crowd wedges inside the hull ran 21-23%
+KEY_MIN_RECTANGULARITY = 0.75   # key fills 0.90-0.96 of its minAreaRect; wedges 0.51
+KEY_MIN_ENCLOSURE = 0.90        # fraction of the ring around it that must be floor
+KEY_EDGE_MARGIN = 0.008         # of frame width; a key touching the floor's edge isn't one
+KEY_SAMPLE_POINTS = 800
 MAX_COST_PX = 18.0               # mean line-to-model distance we'll still believe
 # The modelled half-court can't be a sliver of the visible floor, nor vastly
 # bigger than it. Bounds are loose -- they exist to rule out collapse, not to
@@ -126,7 +131,7 @@ def median_frame(video_path, samples=31):
     return np.median(np.stack(frames), axis=0).astype(np.uint8)
 
 
-def detect_line_pixels(frame, floor_region, floor_mask=None, return_paint=False):
+def detect_line_pixels(frame, floor_region, floor_mask=None):
     """Thin painted structures inside the floor -- the court's markings.
 
     Markings are thin; filled paint, players and shadows are not. Subtracting
@@ -171,8 +176,7 @@ def detect_line_pixels(frame, floor_region, floor_mask=None, return_paint=False)
         if stats[label, cv2.CC_STAT_AREA] >= floor_area * PAINT_MIN_FLOOR_FRACTION:
             paint[labels == label] = 255
     outlines = cv2.morphologyEx(paint, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
-    markings = cv2.bitwise_or(thin, outlines)
-    return (markings, paint) if return_paint else markings
+    return cv2.bitwise_or(thin, outlines)
 
 
 def _distance_to_lines(line_pixels):
@@ -404,25 +408,79 @@ def _refine(img_corners, court_corners, model_points, distance, shape, step,
     return corners, best
 
 
-def _largest_paint_blob(paint_mask):
-    """The paint pixels of the single biggest painted area, subsampled.
+def detect_key_paint(frame, floor_region):
+    """Pixels of the painted key, or None when this view doesn't show one.
 
-    One blob rather than all of them: a floor may also have a painted centre
-    circle or a coloured apron, and scoring the lane against those as well
-    would count a correct lane as partly wrong. The key is the largest
-    painted area on a basketball floor.
+    Returning None is a normal outcome, not a failure. The key anchor exists
+    to break the ambiguity of a multi-sport floor, so it is only worth having
+    when we are sure which region the key is; a wrongly chosen one points the
+    search away from the answer, which is worse than not anchoring at all.
+    Measured: taking the biggest painted area scored the TRUE alignment at 0%
+    agreement on a diagonal camera, because the floor's convex hull spans
+    wedges of crowd past the court's corners and the largest of those dwarfs
+    the key.
+
+    Three properties identify it, and a region must have all three:
+
+    - Size. The key is a few percent of the floor. Those crowd wedges ran to
+      21-23%, well outside the range a lane can occupy.
+    - Rectangularity, measured as how much of its minimum-area rectangle it
+      fills. A lane is a rectangle in perspective, so it fills 0.90-0.96; the
+      wedges fill 0.51. Note this is not convexity -- the wedges are convex,
+      and testing them against their convex hull passed them at 1.00.
+    - Enclosure. The key lies within the floor, with floor all around it.
+
+    On a camera looking down the court the key fails enclosure honestly: the
+    apron beyond the far baseline is only a few pixels deep in perspective,
+    so the key merges with the crowd and becomes a notch in the floor's edge
+    rather than a region inside it. There is no key to find in that view, and
+    this returns None rather than settling for the nearest thing.
     """
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(paint_mask, connectivity=8)
-    if count < 2:
+    from courtiq_core import floor_color_mask
+
+    wood = floor_color_mask(frame)
+    contours, _ = cv2.findContours(floor_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return None
-    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    if stats[biggest, cv2.CC_STAT_AREA] < PAINT_MIN_PIXELS:
+    boundary = np.zeros(floor_region.shape, np.uint8)
+    cv2.drawContours(boundary, [max(contours, key=cv2.contourArea)], -1, 255,
+                     max(3, int(frame.shape[1] * KEY_EDGE_MARGIN)))
+
+    non_floor = ((wood == 0) & (floor_region > 0)).astype(np.uint8) * 255
+    size = max(3, int(frame.shape[1] * LINE_KERNEL_FRACTION) | 1)
+    thick = cv2.morphologyEx(non_floor, cv2.MORPH_OPEN, np.ones((size, size), np.uint8))
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(thick, connectivity=8)
+    floor_area = float(cv2.countNonZero(floor_region))
+    best = None
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if not (floor_area * KEY_MIN_FLOOR_FRACTION <= area
+                <= floor_area * KEY_MAX_FLOOR_FRACTION):
+            continue
+        component = (labels == label).astype(np.uint8) * 255
+        if cv2.countNonZero(cv2.bitwise_and(component, boundary)):
+            continue  # runs into the edge of the floor, so it is not enclosed
+        outline, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not outline:
+            continue
+        rect = cv2.minAreaRect(max(outline, key=cv2.contourArea))
+        rect_area = rect[1][0] * rect[1][1]
+        if rect_area <= 0 or area / rect_area < KEY_MIN_RECTANGULARITY:
+            continue
+        ring = cv2.subtract(cv2.dilate(component, np.ones((15, 15), np.uint8)), component)
+        ring_px = max(1, cv2.countNonZero(ring))
+        if cv2.countNonZero(cv2.bitwise_and(ring, wood)) / ring_px < KEY_MIN_ENCLOSURE:
+            continue
+        if best is None or area > best[0]:
+            best = (area, label)
+    if best is None:
         return None
-    ys, xs = np.nonzero(labels == biggest)
-    if len(xs) > 800:  # enough to locate an area; cheap enough for the inner loop
-        pick = np.linspace(0, len(xs) - 1, 800).astype(np.int32)
+    ys, xs = np.nonzero(labels == best[1])
+    if len(xs) > KEY_SAMPLE_POINTS:  # enough to locate an area, cheap in the search loop
+        pick = np.linspace(0, len(xs) - 1, KEY_SAMPLE_POINTS).astype(np.int32)
         ys, xs = ys[pick], xs[pick]
-    return np.stack([xs, ys], axis=1).astype(np.float32)
+    return np.stack([xs, ys], axis=1).astype(np.float32), thick
 
 
 def _paint_terms(model, paint_img, paint_mask):
@@ -446,11 +504,14 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
     """
     if cv2 is None or np is None:
         raise RuntimeError("opencv-python and numpy are required.")
-    line_pixels, paint_mask = detect_line_pixels(
-        frame, floor_region, floor_mask, return_paint=True)
+    line_pixels = detect_line_pixels(frame, floor_region, floor_mask)
     if cv2.countNonZero(line_pixels) < 200:
         return None
-    paint_img = _largest_paint_blob(paint_mask)
+    found = detect_key_paint(frame, floor_region)
+    paint_img, paint_mask = found if found else (None, None)
+    if verbose:
+        print("[court_fit] painted key found, anchoring on it." if found
+              else "[court_fit] no painted key in this view; fitting on markings alone.")
     distance = _distance_to_lines(line_pixels)
     shape = frame.shape[:2]
 
