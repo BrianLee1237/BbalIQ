@@ -69,7 +69,7 @@ def render(model, court_to_img, paint_lane=True, colours=None):
     return frame, to_img
 
 
-def evaluate(model, frame, to_img, label):
+def evaluate(model, frame, to_img, label, hoop_px=None):
     floor_mask = c.court_quad_debug(frame).get("morphed_color_mask")
     if floor_mask is None:
         print(f"  {label}: FAIL -- no floor mask")
@@ -79,7 +79,8 @@ def evaluate(model, frame, to_img, label):
         print(f"  {label}: FAIL -- no floor region")
         return False
 
-    result = court_fit.fit_court(frame, floor_region, floor_mask, verbose=False)
+    result = court_fit.fit_court(frame, floor_region, floor_mask,
+                                 hoop_px=hoop_px, verbose=False)
     if result is None:
         print(f"  {label}: FAIL -- no fit")
         return False
@@ -108,6 +109,34 @@ COLOUR_SCHEMES = {
     "grey sports floor": ((140, 140, 140), (70, 130, 60), (230, 230, 230)),
     "warm tungsten": ((110, 165, 205), (105, 70, 45), (90, 110, 130)),
 }
+
+
+def add_other_sport_lines(frame, to_img, model, colour=(120, 90, 90)):
+    """Lines belonging to OTHER sports, as school gyms are always marked.
+
+    A gym floor typically carries volleyball, badminton and often a second,
+    cross-wise basketball court on top of the main one. These are the same
+    kind of painted line, so they cannot be told apart by appearance -- and
+    they let a wrong alignment land its model lines on somebody else's
+    markings. Measured on real footage: a 3.0px marking error with the lane
+    sitting in open floor and the arc curving the wrong way.
+    """
+    w, hl = model.width, model.half_length
+
+    def line(a, b):
+        cv2.line(frame, tuple(map(int, to_img(a))), tuple(map(int, to_img(b))), colour, 4)
+
+    # Volleyball court, inset and rotated relative to the basketball court.
+    for a, b in [((6, 6), (w - 6, 6)), ((6, hl - 8), (w - 6, hl - 8)),
+                 ((6, 6), (6, hl - 8)), ((w - 6, 6), (w - 6, hl - 8)),
+                 ((6, (hl - 2) / 2), (w - 6, (hl - 2) / 2))]:
+        line(a, b)
+    # A cross-court practice basketball key, off to one side.
+    for a, b in [((3, 12), (3, 24)), ((15, 12), (15, 24)), ((3, 24), (15, 24))]:
+        line(a, b)
+    # Badminton tramlines.
+    for offset in (11, 14):
+        line((offset, 4), (offset, hl - 6))
 
 
 def add_players(frame, to_img, model, count=10, seed=7):
@@ -161,7 +190,8 @@ def check_realistic(model, camera, label, colours=None, players=True):
     return evaluate(model, frame, to_img, label)
 
 
-def check_video_median(model, camera, label, colours=None):
+def check_video_median(model, camera, label, colours=None, clutter=False,
+                       use_hoop=True):
     """The real code path: players move between frames, so fit the median.
 
     Fitting a single frame has to cope with ten bodies covering the markings.
@@ -177,6 +207,8 @@ def check_video_median(model, camera, label, colours=None):
         return cv2.perspectiveTransform(src, court_to_img)[0][0]
 
     base, _ = render(model, court_to_img, colours=colours)
+    if clutter:
+        add_other_sport_lines(base, to_img, model)
     path = "/tmp/courtiq_fit_video.mp4"
     writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (IMG_W, IMG_H))
     for frame_index in range(40):
@@ -189,7 +221,13 @@ def check_video_median(model, camera, label, colours=None):
     if median is None:
         print(f"  {label}: FAIL -- no median frame")
         return False
-    return evaluate(model, median, to_img, label)
+    hoop_px = None
+    if use_hoop:
+        # The rim as the detector would report it: above its floor point,
+        # because it's 10ft up.
+        floor_point = to_img(model.hoop)
+        hoop_px = (float(floor_point[0]), float(floor_point[1]) - 130.0)
+    return evaluate(model, median, to_img, label, hoop_px=hoop_px)
 
 
 def main():
@@ -212,6 +250,10 @@ def main():
     for camera in CAMERAS:
         results.append(check_video_median(COURT_MODELS[0], camera,
                                           f"hs median / {camera:18s}"))
+    print("  -- multi-sport line clutter (as real gyms are marked) --")
+    for camera in CAMERAS:
+        results.append(check_video_median(COURT_MODELS[0], camera,
+                                          f"hs clutter / {camera:18s}", clutter=True))
     print("  -- varied colours, players moving, median frame --")
     for name, colours in COLOUR_SCHEMES.items():
         results.append(check_video_median(COURT_MODELS[0], "sideline",

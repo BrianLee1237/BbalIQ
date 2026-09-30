@@ -1533,7 +1533,13 @@ def auto_homography(video_path: str) -> "np.ndarray":
             if line_floor_mask is not None:
                 line_floor_region = floor_hull_region(line_floor_mask)
                 if line_floor_region is not None:
-                    fitted = court_fit.fit_court(median, line_floor_region, line_floor_mask)
+                    # Give the fit the rim if we have it. A gym floor carries
+                    # several sports' markings, and a basketball model can land
+                    # its lines neatly on somebody else's and still be in the
+                    # wrong place; the rim says where the court actually is.
+                    rim = detect_hoop(video_path)
+                    fitted = court_fit.fit_court(median, line_floor_region, line_floor_mask,
+                                                 hoop_px=rim)
                     if fitted is not None:
                         homography, info = fitted
                         print(f"[courtiq_core] Calibrated from court line markings "

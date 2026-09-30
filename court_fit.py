@@ -58,7 +58,19 @@ DISTANCE_CAP_PX = 40.0
 # wander, since the rest still has to line up.
 TRIM_KEEP_FRACTION = 0.7
 COVERAGE_CELL_PX = 14.0
-COVERAGE_WEIGHT = 60.0
+# Coverage must stay gentle. A school gym floor carries several sports' lines
+# -- volleyball, badminton, a second basketball court -- and a basketball
+# model can never explain those, so demanding full coverage penalises the
+# CORRECT alignment hardest. It's here to stop the model shrinking onto a
+# dense patch, not to insist every line belongs to basketball.
+COVERAGE_WEIGHT = 25.0
+# The rim is a far stronger anchor than any line, because there's exactly one
+# and we detect it directly. Its floor point sits at the middle of the court's
+# width, just off the baseline, so a fit that puts the court elsewhere is
+# wrong no matter how neatly its lines happen to land on somebody else's
+# sport. Measured on real footage: a 3.0px marking error with the lane sitting
+# in open floor and the arc curving the wrong way.
+HOOP_WEIGHT = 90.0
 MAX_COST_PX = 18.0               # mean line-to-model distance we'll still believe
 # The modelled half-court can't be a sliver of the visible floor, nor vastly
 # bigger than it. Bounds are loose -- they exist to rule out collapse, not to
@@ -177,7 +189,8 @@ def _is_convex(corners):
 
 
 def _cost(img_corners, court_corners, model_points, distance, shape,
-          floor_area=None, line_cells=None, grid_shape=None):
+          floor_area=None, line_cells=None, grid_shape=None,
+          hoop_px=None, hoop_court=None):
     """Mean distance from the model's markings to the nearest real marking.
 
     Rejects degenerate hypotheses first. Without that, the search has a
@@ -241,7 +254,20 @@ def _cost(img_corners, court_corners, model_points, distance, shape,
     spread[:, 1:] |= occupied[:, :-1]
     spread[:, :-1] |= occupied[:, 1:]
     coverage = float(spread.ravel()[line_cells].mean()) if len(line_cells) else 0.0
-    return model_to_line + COVERAGE_WEIGHT * (1.0 - coverage)
+    total = model_to_line + COVERAGE_WEIGHT * (1.0 - coverage)
+
+    if hoop_px is not None and hoop_court is not None:
+        projected_hoop = cv2.perspectiveTransform(
+            np.array([[[hoop_court[0], hoop_court[1]]]], dtype=np.float32), transform
+        )[0][0]
+        # Across-frame position should match the rim's. The rim is 10ft up so
+        # it sits ABOVE its floor point in the image, which constrains the
+        # vertical ordering but not the distance -- that depends on camera
+        # height, which we don't know.
+        across = abs(float(projected_hoop[0]) - hoop_px[0]) / max(1.0, width)
+        wrong_side = max(0.0, hoop_px[1] - float(projected_hoop[1])) / max(1.0, height)
+        total += HOOP_WEIGHT * (across + wrong_side)
+    return total
 
 
 def _hull_quad(hull):
@@ -287,11 +313,11 @@ def _global_moves(corners, step):
 
 
 def _refine(img_corners, court_corners, model_points, distance, shape, step,
-            floor_area, line_cells, grid_shape):
+            floor_area, line_cells, grid_shape, hoop_px=None, hoop_court=None):
     """Search for the corner positions that best align the model's markings."""
     def cost_of(candidate):
         return _cost(candidate, court_corners, model_points, distance, shape,
-                     floor_area, line_cells, grid_shape)
+                     floor_area, line_cells, grid_shape, hoop_px, hoop_court)
 
     corners = [list(pt) for pt in img_corners]
     best = cost_of(corners)
@@ -367,7 +393,7 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
                              for x, y in rotated]
                     corners, cost = _refine(start, court_corners, model_points,
                                             distance, shape, step, floor_area,
-                                            line_cells, grid_shape)
+                                            line_cells, grid_shape, hoop_px, model.hoop)
                     if best is None or cost < best[0]:
                         best = (cost, corners, model, mirrored, rotation)
 
@@ -390,7 +416,8 @@ def fit_court(frame, floor_region, floor_mask, hoop_px=None, verbose=True):
                      for x, y in start]
         polished, polished_cost = _refine(
             start, model.corners, model_points, distance, shape,
-            shape[1] * POLISH_STEP_FRACTION, floor_area, line_cells, grid_shape)
+            shape[1] * POLISH_STEP_FRACTION, floor_area, line_cells, grid_shape,
+            hoop_px, model.hoop)
         if polished_cost < cost:
             cost, corners = polished_cost, polished
     # Judge acceptance on the marking distance alone. The combined score

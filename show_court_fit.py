@@ -40,7 +40,13 @@ def main():
     cv2.imwrite("court_fit_lines.png", line_pixels)
     print("Wrote court_fit_lines.png (the markings the fit works from)")
 
-    fitted = court_fit.fit_court(median, floor_region, floor_mask)
+    rim = None
+    try:
+        rim = c.detect_hoop(video_path)
+        print(f"Rim detected at {tuple(round(v) for v in rim)}" if rim else "No rim detected")
+    except Exception as exc:  # the detector needs model weights; the fit can proceed without
+        print(f"Rim detection unavailable ({exc}); fitting on markings alone.")
+    fitted = court_fit.fit_court(median, floor_region, floor_mask, hoop_px=rim)
     if fitted is None:
         raise SystemExit("No court fit -- see the message above for why.")
     homography, info = fitted
@@ -63,8 +69,14 @@ def main():
 
     hoop_px = to_px(model.hoop)
     cv2.circle(overlay, hoop_px, 12, (0, 0, 255), 3)
-    cv2.putText(overlay, "HOOP", (hoop_px[0] + 16, hoop_px[1]),
+    cv2.putText(overlay, "HOOP (model)", (hoop_px[0] + 16, hoop_px[1]),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    if rim is not None:
+        rim_px = tuple(map(int, rim))
+        cv2.circle(overlay, rim_px, 14, (0, 255, 0), 3)
+        cv2.putText(overlay, "RIM (detected)", (rim_px[0] + 18, rim_px[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.line(overlay, rim_px, hoop_px, (0, 255, 0), 1)
 
     cv2.putText(overlay, f"{model.name} court, {info['cost']:.1f}px marking error",
                 (20, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
