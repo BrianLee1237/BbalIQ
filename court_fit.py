@@ -71,11 +71,6 @@ COVERAGE_WEIGHT = 25.0
 # sport. Measured on real footage: a 3.0px marking error with the lane sitting
 # in open floor and the arc curving the wrong way.
 HOOP_WEIGHT = 90.0
-HOOP_HEIGHT_FT = 10.0            # a basketball rim, by the rules of the game
-# Turns the rim miss in feet into a penalty: at this many feet out, the rim
-# term costs HOOP_WEIGHT. Set to about the lane's width, so landing the hoop
-# a lane away from the rim is already a decisive objection.
-HOOP_ERROR_SCALE_FT = 12.0
 
 # The filled painted key, matched by overlap. Lines alone cannot say WHERE on
 # a multi-sport floor the basketball court is, because volleyball, badminton
@@ -282,28 +277,26 @@ def _cost(img_corners, court_corners, model_points, distance, shape,
         projected_hoop = cv2.perspectiveTransform(
             np.array([[[hoop_court[0], hoop_court[1]]]], dtype=np.float32), transform
         )[0][0]
-        # The rim is 10ft above its floor point, so in the image it sits
-        # above that point by roughly ten times whatever a foot is worth
-        # there. Measure the gap against that, in feet, rather than only
-        # checking the rim is somewhere above: a court laid at right angles
-        # to the true one put its hoop 600px below the rim at the same x,
-        # which scored zero on both an across-frame test and an ordering
-        # test and so was never penalised at all.
+        # Across-frame position should match the rim's. The rim is 10ft up so
+        # it sits ABOVE its floor point in the image, which constrains the
+        # vertical ordering but not the distance -- that depends on camera
+        # height, which we don't know.
         #
-        # The scale comes from the hypothesis itself -- how far apart a foot
-        # of court lands near the hoop -- so this holds at any resolution or
-        # camera distance.
-        neighbour = cv2.perspectiveTransform(
-            np.array([[[hoop_court[0], hoop_court[1] + 1.0]]], dtype=np.float32), transform
-        )[0][0]
-        px_per_ft = max(1e-6, float(np.hypot(neighbour[0] - projected_hoop[0],
-                                             neighbour[1] - projected_hoop[1])))
-        gap_x = (float(projected_hoop[0]) - hoop_px[0]) / px_per_ft
-        gap_y = (float(projected_hoop[1]) - hoop_px[1]) / px_per_ft
-        # Sideways the rim should be right over its floor point; vertically
-        # it should be about a rim's height above it.
-        error_ft = math.hypot(gap_x, gap_y - HOOP_HEIGHT_FT)
-        total += HOOP_WEIGHT * (error_ft / HOOP_ERROR_SCALE_FT)
+        # An earlier attempt did charge for that distance, taking it to be
+        # 10ft at the court's own pixels-per-foot. That is wrong: a vertical
+        # world distance does not project at the in-plane scale. How far
+        # above its floor point a rim appears depends on where the camera is
+        # -- nearly overhead from high up, far from low down -- and assuming
+        # otherwise punished correct fits, turning a camera that landed
+        # within 0.5ft into a 12ft miss on the wrong court size.
+        #
+        # This leaves a known gap: a court laid at right angles to the true
+        # one can put its hoop directly below the rim and be charged nothing.
+        # Closing it needs something that actually bounds the camera's
+        # height, not a guess dressed up as one.
+        across = abs(float(projected_hoop[0]) - hoop_px[0]) / max(1.0, width)
+        wrong_side = max(0.0, hoop_px[1] - float(projected_hoop[1])) / max(1.0, height)
+        total += HOOP_WEIGHT * (across + wrong_side)
 
     if paint_img is not None and lane_grid is not None:
         total += PAINT_WEIGHT * (1.0 - _paint_agreement(
