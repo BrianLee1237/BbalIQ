@@ -35,10 +35,26 @@ def main():
     if floor_region is None:
         raise SystemExit("No floor region.")
 
-    line_pixels = court_fit.detect_line_pixels(median, floor_region)
+    line_pixels, paint_mask = court_fit.detect_line_pixels(
+        median, floor_region, return_paint=True)
     print(f"Court line pixels found: {cv2.countNonZero(line_pixels)}")
     cv2.imwrite("court_fit_lines.png", line_pixels)
     print("Wrote court_fit_lines.png (the markings the fit works from)")
+
+    # The painted key is what tells the fit WHERE on the floor the court is,
+    # so show which filled area was taken for it. If this comes back empty the
+    # floor's key isn't painted a distinct colour, and the fit is working from
+    # the markings alone -- which on a multi-sport floor is ambiguous.
+    blob = court_fit._largest_paint_blob(paint_mask)
+    if blob is None:
+        print("No painted key found -- fitting on markings alone.")
+    else:
+        keyed = median.copy()
+        for x, y in blob.astype(int):
+            cv2.circle(keyed, (x, y), 2, (0, 0, 255), -1)
+        cv2.imwrite("court_fit_key.png", keyed)
+        print("Wrote court_fit_key.png -- the red dots should cover the painted "
+              "key under the basket, and nothing else.")
 
     rim = None
     try:
