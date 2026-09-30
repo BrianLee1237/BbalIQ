@@ -59,6 +59,7 @@ ENDPOINT_NOISE_LINE_WIDTHS = 5.0
 # same pencil found twice.
 MIN_AXIS_SEPARATION_DEG = 12.0
 RANSAC_ITERATIONS = 6000
+HORIZON_SAMPLES = 4000
 
 
 def _line_width_px(line_pixels):
@@ -119,7 +120,7 @@ def _as_lines(segments):
     ])
 
 
-def find_axes(segments, line_width_px):
+def find_axes(segments, line_width_px, horizon=None):
     """The two vanishing points the segments converge on.
 
     Scored by angle, not by distance to the vanishing point. A distant
@@ -163,17 +164,39 @@ def find_axes(segments, line_width_px):
         if len(pool) < 2:
             break
         best = None
-        for _ in range(RANSAC_ITERATIONS):
-            i, j = rng.choice(pool, 2, replace=False)
-            vp = np.cross(lines[i], lines[j])
-            if not np.isfinite(vp).all() or np.allclose(vp, 0.0):
-                continue
-            inl = inliers_of(vp, available)
-            if len(inl) < 3:
-                continue
-            weight = float(lengths[inl].sum())
-            if best is None or weight > best[0]:
-                best = (weight, vp, inl)
+        if horizon is not None:
+            # With the horizon known there is nothing to sample: a ground
+            # plane's vanishing point lies on it, and each segment's line
+            # meets it in exactly one place. So every segment proposes one
+            # candidate, and we simply take the best-supported.
+            #
+            # This replaces projecting a freely-sampled vanishing point onto
+            # the horizon afterwards, which quietly failed: the projection
+            # moved the point far enough that its own segments stopped
+            # counting as inliers, so the code fell back to the unconstrained
+            # estimate it was meant to correct, leaving it 285px off.
+            for i in pool:
+                vp = np.cross(lines[i], horizon)
+                if not np.isfinite(vp).all() or np.allclose(vp, 0.0):
+                    continue
+                inl = inliers_of(vp, available)
+                if len(inl) < 2:
+                    continue
+                weight = float(lengths[inl].sum())
+                if best is None or weight > best[0]:
+                    best = (weight, vp, inl)
+        else:
+            for _ in range(RANSAC_ITERATIONS):
+                i, j = rng.choice(pool, 2, replace=False)
+                vp = np.cross(lines[i], lines[j])
+                if not np.isfinite(vp).all() or np.allclose(vp, 0.0):
+                    continue
+                inl = inliers_of(vp, available)
+                if len(inl) < 3:
+                    continue
+                weight = float(lengths[inl].sum())
+                if best is None or weight > best[0]:
+                    best = (weight, vp, inl)
         if best is None:
             break
         weight, vp, inl = best
@@ -184,11 +207,17 @@ def find_axes(segments, line_width_px):
         # says the court recedes to nothing within the picture and collapsed
         # the fit to a sliver. Every inlier together is far better posed.
         for _ in range(3):
-            refined = _least_squares_vp(lines[inl], lengths[inl])
+            if horizon is not None:
+                refined = _vp_on_horizon(lines[inl], lengths[inl], horizon)
+            else:
+                refined = _least_squares_vp(lines[inl], lengths[inl])
             if refined is None:
                 break
             grown = inliers_of(refined, available | set(inl))
-            if len(grown) < 3:
+            if len(grown) < 2:
+                # Too few to refit again, but the refined point is still the
+                # better estimate -- keep it rather than reverting.
+                vp = refined
                 break
             vp, inl = refined, grown
         weight = float(lengths[inl].sum())
@@ -200,6 +229,105 @@ def find_axes(segments, line_width_px):
     if _axis_separation_deg(axes[0], axes[1], mids) < MIN_AXIS_SEPARATION_DEG:
         return None
     return axes
+
+
+def horizon_from_uprights(boxes, min_separation_px=None):
+    """The ground plane's horizon, from people standing on it.
+
+    Two upright objects of the same height give a point on the horizon: the
+    line through their heads and the line through their feet meet there.
+    Players are near enough the same height as each other for this, and a
+    game frame has ten of them, so there are plenty of pairs.
+
+    This is worth having because a pencil of markings can leave its vanishing
+    point badly determined -- five short, nearly parallel segments put it
+    almost anywhere, and measured on real footage one landed 218px off the
+    horizon while the well-supported axis sat 49px from it. The horizon is
+    the constraint that says so, and it comes from the players rather than
+    from the markings, so it is independent evidence.
+
+    `boxes` are (x1, y1, x2, y2) player boxes. Returns a homogeneous line, or
+    None if there aren't enough usable pairs.
+    """
+    if len(boxes) < 4:
+        return None
+    feet, heads, heights = [], [], []
+    for x1, y1, x2, y2 in boxes:
+        cx = (x1 + x2) / 2.0
+        feet.append(np.array([cx, y2, 1.0]))
+        heads.append(np.array([cx, y1, 1.0]))
+        heights.append(y2 - y1)
+    heights = np.array(heights)
+    # Drop boxes whose height is out of keeping with the rest: those are two
+    # players merged into one box, or someone cut off by the frame, and
+    # either breaks the equal-height assumption this rests on.
+    low, high = np.percentile(heights, 15), np.percentile(heights, 95)
+    usable = [i for i in range(len(boxes)) if low <= heights[i] <= high]
+    if len(usable) < 4:
+        return None
+
+    if min_separation_px is None:
+        # Two people standing nearly in line give a direction dominated by
+        # box noise. Require them to be apart by a player's own height,
+        # which scales with the footage instead of being a pixel count.
+        min_separation_px = float(np.median(heights[usable]))
+
+    rng = np.random.default_rng(0)
+    points = []
+    for _ in range(HORIZON_SAMPLES):
+        i, j = rng.choice(usable, 2, replace=False)
+        if abs(feet[i][0] - feet[j][0]) < min_separation_px:
+            continue
+        meet = np.cross(np.cross(feet[i], feet[j]), np.cross(heads[i], heads[j]))
+        if abs(meet[2]) < 1e-9:
+            continue
+        points.append((meet / meet[2])[:2])
+    if len(points) < 8:
+        return None
+
+    points = np.array(points)
+    centre = np.median(points, axis=0)
+    spread = np.median(np.abs(points - centre), axis=0)
+    kept = points[np.abs(points[:, 1] - centre[1]) < 5.0 * max(1.0, spread[1])]
+    if len(kept) < 8:
+        return None
+    vx, vy, x0, y0 = cv2.fitLine(kept.astype(np.float32), cv2.DIST_HUBER,
+                                 0, 0.01, 0.01).ravel()
+    return np.cross([x0, y0, 1.0], [x0 + vx, y0 + vy, 1.0])
+
+
+def _vp_on_horizon(inlier_lines, weights, horizon):
+    """Best vanishing point for this pencil, restricted to the horizon.
+
+    A vanishing point of the ground plane lies on its horizon, so there is
+    one degree of freedom here, not two. Writing the point as a combination
+    of two points spanning the horizon turns the fit into a two-unknown
+    least-squares problem, which a handful of segments can support where an
+    unconstrained fit cannot.
+    """
+    a, b, c = horizon
+    if abs(a) < 1e-12 and abs(b) < 1e-12:
+        return None
+    # Any point on the line, plus its direction (a point at infinity on it).
+    if abs(a) >= abs(b):
+        anchor = np.array([-c / a, 0.0, 1.0])
+    else:
+        anchor = np.array([0.0, -c / b, 1.0])
+    along = np.array([b, -a, 0.0])
+
+    scale = np.maximum(np.hypot(inlier_lines[:, 0], inlier_lines[:, 1]), 1e-9)
+    normalised = inlier_lines / scale[:, None]
+    weighting = np.sqrt(np.maximum(weights, 1e-9))[:, None]
+    design = np.stack([normalised @ anchor, normalised @ along], axis=1) * weighting
+    try:
+        _, _, vt = np.linalg.svd(design)
+    except np.linalg.LinAlgError:
+        return None
+    alpha, beta = vt[-1]
+    vp = alpha * anchor + beta * along
+    if not np.isfinite(vp).all() or np.allclose(vp, 0.0):
+        return None
+    return vp
 
 
 def _least_squares_vp(inlier_lines, weights):
