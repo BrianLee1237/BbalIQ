@@ -170,10 +170,68 @@ def check_occlusion(tmp_path="/tmp/courtiq_occlusion_test.mp4"):
     return ok
 
 
+def check_false_hoop():
+    """Reproduces the real-footage failure: the rim detector also fires on
+    the crowd, and a hoop in the stands makes the key search grab whatever
+    paint is nearest it -- a centre-court logo -- which then defines the
+    whole coordinate system. The bad candidate has to be REJECTED, not
+    silently used.
+    """
+    court_to_img = build(CAMERAS["sideline A"])
+    _, to_img = render(court_to_img)
+
+    frame = np.full((IMG_H, IMG_W, 3), CROWD_BGR, dtype=np.uint8)
+    for poly, color in [
+        ([(-4, -4), (54, -4), (54, 51), (-4, 51)], WOOD_BGR),
+        (c.KEY_CORNERS_FT, KEY_BGR),
+        # A painted logo out in open floor, with court running away on BOTH
+        # sides of it -- that's what makes it distinguishable from the lane,
+        # which is pinned against the baseline.
+        ([(18, 22), (32, 22), (32, 32), (18, 32)], KEY_BGR),
+    ]:
+        cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+
+    floor_mask = c.court_quad_debug(frame).get("morphed_color_mask")
+    if floor_mask is None:
+        print("  false hoop: FAIL -- no floor mask")
+        return False
+
+    # A hoop "detected" in the crowd, near the logo rather than the rim.
+    logo_img = to_img((25, 27))
+    false_hoop = (float(logo_img[0]), float(logo_img[1]) - 250.0)
+    bad = c.detect_key_with_score(frame, false_hoop)
+    if bad is None:
+        print("  false hoop: PASS (no region found near the false hoop)")
+        return True
+    rejected = c.key_anchored_homography(bad[0], floor_mask) is None
+
+    # ...and the real rim must still calibrate correctly on the same frame.
+    hoop_floor = to_img((25, 5.25))
+    real_hoop = (float(hoop_floor[0]), float(hoop_floor[1]) - 120.0)
+    good = c.detect_key_with_score(frame, real_hoop)
+    H = c.key_anchored_homography(good[0], floor_mask) if good else None
+    if H is None:
+        print("  false hoop: FAIL -- real rim no longer calibrates")
+        return False
+    direct = mirrored = 0.0
+    for pt in CHECKS:
+        back = c.project_point(H, tuple(map(float, to_img(pt))))
+        direct = max(direct, math.hypot(back[0] - pt[0], back[1] - pt[1]))
+        mirrored = max(mirrored, math.hypot(back[0] - (50 - pt[0]), back[1] - pt[1]))
+    error = min(direct, mirrored)
+
+    ok = rejected and error < TOLERANCE_FT
+    print(f"  false hoop (crowd -> logo): bad candidate "
+          f"{'rejected' if rejected else 'ACCEPTED (bad)'}, "
+          f"real rim error {error:.2f} ft -- {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     print(f"Court calibration vs ground truth (tolerance {TOLERANCE_FT} ft):")
     results = [check_camera(name, pts) for name, pts in CAMERAS.items()]
     results.append(check_occlusion())
+    results.append(check_false_hoop())
     failures = results.count(False)
     print(f"\n{len(results) - failures}/{len(results)} checks pass")
     return 1 if failures else 0

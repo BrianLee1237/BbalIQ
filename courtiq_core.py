@@ -863,6 +863,11 @@ KEY_CORNERS_FT = [(17.0, 0.0), (33.0, 0.0), (33.0, 19.0), (17.0, 19.0)]
 KEY_MIN_AREA_FRACTION = 0.005   # a painted region smaller than this is noise, not the key
 KEY_MAX_AREA_FRACTION = 0.30    # ...larger than this isn't the key either
 KEY_OPEN_KERNEL_FRACTION = 0.004
+# The lane is pinned to the baseline; paint out in open floor isn't. Measured
+# on synthetic ground truth: real lanes land at 0.05-0.15, an open-floor logo
+# at ~0.54. Sits between the two with margin on both sides rather than hugging
+# either.
+KEY_BASELINE_EDGE_MAX_RATIO = 0.35
 
 
 def detect_painted_regions(frame) -> list:
@@ -984,6 +989,36 @@ def detect_key_with_score(frame, hoop_px):
 
 
 KEY_SAMPLE_FRAMES = int(os.environ.get("COURTIQ_KEY_SAMPLE_FRAMES", "40"))
+# A calibration is only believable if the floor it implies is court-sized.
+# Deliberately loose -- this is here to catch order-of-magnitude scale
+# errors, not to fine-tune.
+FLOOR_EXTENT_MIN_FT = 25.0
+FLOOR_EXTENT_MAX_FT = 250.0
+
+
+def calibration_is_plausible(homography, floor_quad) -> bool:
+    """Sanity-check a calibration by asking how big it thinks the floor is.
+
+    The key's known 16x19ft size sets the scale, so mistaking something
+    smaller (a logo, a shadow, a painted patch near the crowd) for the key
+    inflates every distance: the visible floor comes out hundreds of feet
+    across. Measuring the floor's implied size therefore catches a wrong
+    key, and it's INDEPENDENT of the fit itself -- the key always maps
+    perfectly to the key by construction, so reprojection error over those
+    same four points proves nothing.
+    """
+    if np is None:
+        raise RuntimeError("numpy is required.")
+    projected = [project_point(homography, pt) for pt in floor_quad]
+    xs = [p[0] for p in projected]
+    ys = [p[1] for p in projected]
+    width_ft = max(xs) - min(xs)
+    length_ft = max(ys) - min(ys)
+    ok = all(FLOOR_EXTENT_MIN_FT <= extent <= FLOOR_EXTENT_MAX_FT
+             for extent in (width_ft, length_ft))
+    print(f"[courtiq_core]   implied floor size: {width_ft:.0f} x {length_ft:.0f} ft "
+          f"-- {'plausible' if ok else 'IMPLAUSIBLE, rejecting'}")
+    return ok
 
 
 def detect_key_quad_from_video(video_path: str, hoop_px) -> Optional[tuple]:
@@ -1095,8 +1130,26 @@ def key_anchored_homography(key_quad, floor_mask) -> Optional["np.ndarray"]:
         midpoint = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
         extents.append(_floor_extent_beyond_edge(floor_mask, centroid, midpoint))
     baseline_edge = int(min(range(4), key=lambda i: extents[i]))
+    opposite_edge = (baseline_edge + 2) % 4
     print(f"[courtiq_core] Floor extent beyond each key edge (px): "
           f"{[round(e) for e in extents]} -> edge {baseline_edge} is the baseline.")
+
+    # The real lane is pinned against the baseline: a few feet of apron on
+    # one side, the whole rest of the court on the other. Measured on
+    # synthetic ground truth that ratio is 0.05-0.15. A painted region out in
+    # open floor -- a centre-circle logo, a painted school name, the kind of
+    # thing picked when the hoop was detected in the crowd -- has floor
+    # running away on BOTH sides, so its ratio sits near 1.0. Rejecting here
+    # catches a mis-identified key that a scale check would miss, since
+    # treating a logo as the key only distorts the scale by a factor or so.
+    if extents[opposite_edge] <= 0:
+        return None
+    ratio = extents[baseline_edge] / extents[opposite_edge]
+    if ratio > KEY_BASELINE_EDGE_MAX_RATIO:
+        print(f"[courtiq_core]   floor extends similarly past both ends of this region "
+              f"(ratio {ratio:.2f} > {KEY_BASELINE_EDGE_MAX_RATIO}) -- it sits in open floor, "
+              f"so it isn't the lane. Rejecting.")
+        return None
 
     rotated = [key_quad[(baseline_edge + k) % 4] for k in range(4)]
 
@@ -1220,28 +1273,43 @@ def auto_homography(video_path: str) -> "np.ndarray":
         "using it for homography without manual clicking. This is a heuristic, not a "
         "guarantee; pass --interactive if results look off."
     )
-    hoop_px = detect_hoop(video_path)
-    if hoop_px is not None:
-        # Preferred: calibrate from the painted key. It is a rectangle of
-        # KNOWN real size (16x19ft), unlike the wood-floor outline, which
-        # includes however much out-of-bounds apron the gym happens to have
-        # and so gets the scale wrong even when its shape looks right.
+    # Calibrate from the painted key: a rectangle of KNOWN real size
+    # (16x19ft), unlike the wood-floor outline, which includes however much
+    # out-of-bounds apron the gym happens to have and so gets the scale
+    # wrong even when its shape looks right.
+    #
+    # The hoop is only used to pick WHICH painted region is the key, but the
+    # detector also fires on the crowd, and a wrong hoop quietly drags the
+    # key and every landmark with it. So rather than trusting the strongest
+    # hoop candidate, try each in turn and keep the first whose calibration
+    # survives a court-geometry check -- the crowd's candidates pick some
+    # unrelated painted patch, which shows up immediately as an absurd
+    # implied floor size.
+    candidates = detect_hoop_candidates(video_path)
+    if candidates:
+        print(f"[courtiq_core] {len(candidates)} hoop candidate(s) found; "
+              f"validating each against court geometry.")
+    for rank, (hoop_x, hoop_y, score) in enumerate(candidates[:HOOP_CANDIDATES_TO_TRY]):
+        hoop_px = (hoop_x, hoop_y)
+        print(f"[courtiq_core] Hoop candidate {rank} at ({hoop_x:.0f}, {hoop_y:.0f}), "
+              f"confidence mass {score:.1f}:")
         found = detect_key_quad_from_video(video_path, hoop_px)
-        if found is not None:
-            key_quad, floor_mask = found
-            key_homography = key_anchored_homography(key_quad, floor_mask)
-            if key_homography is not None:
-                hoop_ft = project_point(key_homography, hoop_px)
-                print(f"[courtiq_core] Calibrated from the painted key. Hoop projects to "
-                      f"({hoop_ft[0]:.1f}, {hoop_ft[1]:.1f}) ft (a real hoop is at "
-                      f"{COURT_LANDMARKS['hoop']}; expect several ft of offset since the rim "
-                      f"is 10ft above the floor plane this maps).")
-                return key_homography
-
-        # Fallback: the floor outline, at least oriented correctly by the hoop.
-        oriented = orient_quad_with_hoop(quad, hoop_px)
-        if oriented is not None:
-            return oriented
+        if found is None:
+            print("[courtiq_core]   no painted key found near it -- rejecting.")
+            continue
+        key_quad, floor_mask = found
+        key_homography = key_anchored_homography(key_quad, floor_mask)
+        if key_homography is None:
+            print("[courtiq_core]   could not solve a homography -- rejecting.")
+            continue
+        if not calibration_is_plausible(key_homography, quad):
+            continue
+        hoop_ft = project_point(key_homography, hoop_px)
+        print(f"[courtiq_core] Calibrated from the painted key. Hoop projects to "
+              f"({hoop_ft[0]:.1f}, {hoop_ft[1]:.1f}) ft (a real hoop is at "
+              f"{COURT_LANDMARKS['hoop']}; expect several ft of offset since the rim "
+              f"is 10ft above the floor plane this maps).")
+        return key_homography
 
     # Last resort: map the wood-floor outline straight onto the court
     # rectangle, assuming a baseline-end camera. Measured against synthetic
@@ -1727,47 +1795,91 @@ HOOP_DETECT_CONF = float(os.environ.get("COURTIQ_HOOP_CONF", "0.25"))
 HOOP_SAMPLE_FRAMES = int(os.environ.get("COURTIQ_HOOP_SAMPLE_FRAMES", "30"))
 
 
-def detect_hoop(video_path: str, model_path: str = BALL_MODEL_PATH) -> Optional[tuple]:
-    """Locate the hoop in image space, as (x_px, y_px), or None if the
-    model has no hoop class or never detects one.
+HOOP_CLUSTER_RADIUS_PX = int(os.environ.get("COURTIQ_HOOP_CLUSTER_RADIUS", "60"))
+HOOP_CANDIDATES_TO_TRY = int(os.environ.get("COURTIQ_HOOP_CANDIDATES", "6"))
 
-    Samples several frames spread across the video and takes the MEDIAN
-    position rather than trusting one frame: the hoop is static, so a
-    median is robust to the occasional frame where a player's head, the
-    backboard edge, or motion blur produces a bad box. A single-frame
-    detection would silently hand back an outlier.
+
+def detect_hoop_candidates(video_path: str, model_path: str = BALL_MODEL_PATH) -> list:
+    """Every plausible hoop position in the video, best first.
+
+    Returns a list of (x_px, y_px, score), where score is the summed
+    detection confidence of a cluster of detections at that position.
+
+    Why clusters rather than one position: measured on real footage the
+    detector finds the real rim reliably, but ALSO fires all over the crowd,
+    and those false positives are spread across the frame. Averaging or
+    taking a median over all of them lands in the middle of the crowd,
+    nowhere near the rim.
+
+    Clustering separates them because the rim is STATIC -- it produces
+    detections at the same pixel position frame after frame -- while crowd
+    false positives sit on people who move, so they scatter instead of
+    stacking up. Returning ranked candidates rather than one answer lets the
+    caller validate each against the court geometry (see auto_homography()),
+    which is a far stronger test than detection confidence alone.
     """
     if cv2 is None or np is None:
         raise RuntimeError("opencv-python and numpy are required.")
     model = _load_model(model_path)
     hoop_class = resolve_hoop_class(model)
     if hoop_class is None:
-        return None
+        return []
 
     capture = cv2.VideoCapture(video_path)
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if frame_count <= 0:
         capture.release()
-        return None
+        return []
     step = max(1, frame_count // HOOP_SAMPLE_FRAMES)
 
-    centers = []
+    detections = []
     for frame_idx in range(0, frame_count, step):
         capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = capture.read()
         if not ok:
             break
         result = model(frame, classes=[hoop_class], conf=HOOP_DETECT_CONF, verbose=False)[0]
-        if result.boxes is not None and len(result.boxes) > 0:
-            box = max(result.boxes, key=lambda b: float(b.conf[0]))
+        if result.boxes is None:
+            continue
+        for box in result.boxes:
             x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
-            centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
+            detections.append(((x1 + x2) / 2, (y1 + y2) / 2, float(box.conf[0])))
     capture.release()
 
-    if not centers:
+    if not detections:
+        return []
+
+    # Greedy clustering: seed from the strongest remaining detection and
+    # absorb everything within HOOP_CLUSTER_RADIUS_PX of it.
+    remaining = sorted(detections, key=lambda d: -d[2])
+    clusters = []
+    while remaining:
+        seed = remaining.pop(0)
+        members = [seed]
+        rest = []
+        for det in remaining:
+            if math.hypot(det[0] - seed[0], det[1] - seed[1]) <= HOOP_CLUSTER_RADIUS_PX:
+                members.append(det)
+            else:
+                rest.append(det)
+        remaining = rest
+        arr = np.array(members)
+        clusters.append((
+            float(np.median(arr[:, 0])),
+            float(np.median(arr[:, 1])),
+            float(arr[:, 2].sum()),
+        ))
+
+    clusters.sort(key=lambda c: -c[2])
+    return clusters
+
+
+def detect_hoop(video_path: str, model_path: str = BALL_MODEL_PATH) -> Optional[tuple]:
+    """Best single hoop position, or None. See detect_hoop_candidates()."""
+    candidates = detect_hoop_candidates(video_path, model_path)
+    if not candidates:
         return None
-    arr = np.array(centers, dtype=np.float64)
-    return (float(np.median(arr[:, 0])), float(np.median(arr[:, 1])))
+    return (candidates[0][0], candidates[0][1])
 
 
 def run_pipeline(
