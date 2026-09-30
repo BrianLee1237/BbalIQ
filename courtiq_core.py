@@ -504,8 +504,19 @@ def detect_court_quad(frame) -> Optional[list]:
 # Kernel sizes are FRACTIONS of frame width, not fixed pixel counts -- a
 # fixed "35px" kernel is a very different relative size on a 640px test
 # image vs. a real ~1850px video frame, which silently broke earlier tuning.
-COURT_HSV_LOWER = (5, 45, 80)
-COURT_HSV_UPPER = (30, 200, 255)
+# The floor's colour is LEARNED per video rather than hardcoded. A fixed
+# tan HSV range assumes every gym has the same floor under the same lights;
+# measured on real footage it missed large areas of genuine wood, which then
+# read as paint and merged the lane into a blob spanning a fifth of the
+# court, making the lane unrecoverable. These are tolerances around the
+# learned colour, not the colour itself.
+FLOOR_HUE_TOLERANCE = 12       # out of OpenCV's 0-180 hue range
+FLOOR_SAT_TOLERANCE = 70       # out of 0-255
+FLOOR_VAL_TOLERANCE = 90       # out of 0-255
+FLOOR_SAMPLE_TOP_FRACTION = 0.35
+FLOOR_COLOR_CANDIDATES = 8     # strongest colour peaks to test before choosing
+FLOOR_MIN_PEAK_PIXELS = 500    # below this the peak is too sparse to measure a spread from
+FLOOR_SPREAD_MARGIN = 12       # slack added around the measured spread
 COURT_CLOSE_KERNEL_FRACTION = 0.03
 COURT_OPEN_KERNEL_FRACTION = 0.03
 COURT_MIN_AREA_FRACTION = 0.15
@@ -527,6 +538,130 @@ COURT_ROW_RUN_MIN_FRACTION = 0.25  # longest run must span this much of the row'
 COURT_ROW_SUSTAIN_COUNT = 10       # ...for this many consecutive rows, to count as "floor starts here"
 COURT_ROW_CLOSE_KERNEL_FRACTION = 0.02  # horizontal close width -- bridges thin painted lines only;
                                          # a court logo is handled separately by _fill_enclosed_holes()
+
+
+def _floor_bounds(centers, lower: bool) -> tuple:
+    """Tolerance box around a learned floor colour, clamped to HSV ranges."""
+    hue_center, sat_center, val_center = centers
+    sign = -1 if lower else 1
+    return (
+        int(min(180, max(0, hue_center + sign * FLOOR_HUE_TOLERANCE))),
+        int(min(255, max(0, sat_center + sign * FLOOR_SAT_TOLERANCE))),
+        int(min(255, max(0, val_center + sign * FLOOR_VAL_TOLERANCE))),
+    )
+
+
+def _refine_bounds(pixels, centers, bin_widths) -> tuple:
+    """Bounds fitted to the spread of the pixels at a colour peak.
+
+    A fixed tolerance box has to be wide enough for a real floor's lighting
+    variation, and that width then swallows paint whose colour sits near the
+    floor's. Percentiles of the pixels actually at the peak adapt instead:
+    nearly nothing for an evenly-lit floor, wide for one with glare and shadow.
+    """
+    at_peak = np.ones(len(pixels), dtype=bool)
+    for channel, (center, width) in enumerate(zip(centers, bin_widths)):
+        at_peak &= np.abs(pixels[:, channel] - center) <= width
+    if at_peak.sum() < FLOOR_MIN_PEAK_PIXELS:
+        return _floor_bounds(centers, lower=True), _floor_bounds(centers, lower=False)
+    peak_pixels = pixels[at_peak]
+    low = np.percentile(peak_pixels, 2, axis=0) - FLOOR_SPREAD_MARGIN
+    high = np.percentile(peak_pixels, 98, axis=0) + FLOOR_SPREAD_MARGIN
+    limits = (180, 255, 255)
+    return (
+        tuple(int(max(0, v)) for v in low),
+        tuple(int(min(limit, v)) for v, limit in zip(high, limits)),
+    )
+
+
+def learn_floor_color(frame) -> tuple:
+    """Learn this footage's floor colour, returning (hsv_lower, hsv_upper).
+
+    The floor is whatever colour dominates the lower part of the frame:
+    it's the single largest thing in a court shot, while the crowd above it
+    is a jumble of many colours that no single bin wins. So the peak of a
+    hue/saturation histogram over that area is the floor, whatever colour
+    the floor happens to be -- pale maple, dark stained wood, a painted
+    surface, warm or cold lighting.
+
+    This replaces a hardcoded tan range, which assumed every gym looks the
+    same. On real footage that range missed large areas of genuine wood;
+    the misses read as paint, merged with the real paint, and produced one
+    region covering a fifth of the court, which made the lane impossible to
+    pick out.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv-python and numpy are required.")
+    height = frame.shape[0]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    sample = hsv[int(height * FLOOR_SAMPLE_TOP_FRACTION):, :]
+
+    # Cluster over all three channels. Hue and saturation alone can't
+    # describe an achromatic floor: a grey sports floor and a grey crowd have
+    # the same (zero) hue and saturation and differ only in brightness, so a
+    # hue/saturation histogram can't tell them apart and the peak lands on
+    # whichever happens to be bigger. Including value separates them.
+    pixels = sample.reshape(-1, 3).astype(np.float32)
+    hist, edges = np.histogramdd(
+        pixels, bins=(18, 8, 8), range=((0, 180), (0, 256), (0, 256)),
+    )
+    # The biggest colour isn't automatically the floor -- a large flat wall or
+    # a uniformly-lit stand can out-vote it. So test the strongest few
+    # candidates and keep the one that behaves like a floor: a single large
+    # region that does NOT reach the top of the frame. In a court shot there
+    # is always something above the floor (crowd, wall, ceiling), so touching
+    # the top edge is the giveaway for a background colour.
+    bin_widths = (
+        edges[0][1] - edges[0][0],
+        edges[1][1] - edges[1][0],
+        edges[2][1] - edges[2][0],
+    )
+    flat = hist.ravel()
+    best = None
+    for flat_index in np.argsort(flat)[::-1][:FLOOR_COLOR_CANDIDATES]:
+        if flat[flat_index] <= 0:
+            break
+        hue_bin, sat_bin, val_bin = np.unravel_index(int(flat_index), hist.shape)
+        centers = (
+            (edges[0][hue_bin] + edges[0][hue_bin + 1]) / 2.0,
+            (edges[1][sat_bin] + edges[1][sat_bin + 1]) / 2.0,
+            (edges[2][val_bin] + edges[2][val_bin + 1]) / 2.0,
+        )
+        # Refine to this candidate's OWN spread before scoring it. Judging
+        # candidates on wide fixed-tolerance masks makes two nearby colours --
+        # a dark red-brown floor and red paint, say -- produce almost
+        # identical masks, so the choice between them comes down to noise.
+        # Refined first, the floor's mask covers the floor and the paint's
+        # covers only the paint, and the floor wins on area by a wide margin.
+        lower, upper = _refine_bounds(pixels, centers, bin_widths)
+        candidate_mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(candidate_mask, connectivity=8)
+        if count <= 1:
+            continue
+        largest = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
+        area = int(stats[largest, cv2.CC_STAT_AREA])
+        touches_top = stats[largest, cv2.CC_STAT_TOP] <= 0
+        score = area * (0.1 if touches_top else 1.0)
+        if best is None or score > best[0]:
+            best = (score, centers)
+
+    if best is None:
+        hue_bin, sat_bin, val_bin = np.unravel_index(int(np.argmax(hist)), hist.shape)
+        best = (0.0, (
+            (edges[0][hue_bin] + edges[0][hue_bin + 1]) / 2.0,
+            (edges[1][sat_bin] + edges[1][sat_bin + 1]) / 2.0,
+            (edges[2][val_bin] + edges[2][val_bin + 1]) / 2.0,
+        ))
+    hue_center, sat_center, val_center = best[1]
+
+    return _refine_bounds(pixels, (hue_center, sat_center, val_center), bin_widths)
+
+
+def floor_color_mask(frame) -> "np.ndarray":
+    """Mask of floor-coloured pixels, using the colour learned from this frame."""
+    lower, upper = learn_floor_color(frame)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, np.array(lower), np.array(upper))
 
 
 def _odd_kernel(size_px: float) -> int:
@@ -666,8 +801,7 @@ def court_quad_debug(frame) -> dict:
     close_k = _odd_kernel(width * COURT_CLOSE_KERNEL_FRACTION)
     open_k = _odd_kernel(width * COURT_OPEN_KERNEL_FRACTION)
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    color_mask = cv2.inRange(hsv, np.array(COURT_HSV_LOWER), np.array(COURT_HSV_UPPER))
+    color_mask = floor_color_mask(frame)
     result["color_mask"] = color_mask
     result["color_coverage"] = float((color_mask > 0).sum()) / frame_area
 
@@ -896,8 +1030,7 @@ def detect_painted_regions(frame, floor_mask=None) -> list:
     if cv2 is None or np is None:
         raise RuntimeError("opencv-python and numpy are required.")
     height, width = frame.shape[:2]
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    wood = cv2.inRange(hsv, np.array(COURT_HSV_LOWER), np.array(COURT_HSV_UPPER))
+    wood = floor_color_mask(frame)
 
     non_wood = (wood == 0).astype(np.uint8) * 255
 

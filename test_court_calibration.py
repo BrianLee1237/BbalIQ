@@ -303,12 +303,68 @@ def check_crowd_bridge():
     return ok
 
 
+FLOOR_SCHEMES = {
+    "pale maple / navy paint": ((150, 190, 215), (90, 50, 40)),
+    "dark stained wood / red paint": ((45, 70, 110), (50, 50, 170)),
+    "grey sports floor / green paint": ((140, 140, 140), (70, 130, 60)),
+    "blue-tinted floor / cream paint": ((170, 140, 110), (190, 220, 235)),
+    "warm tungsten lighting": ((110, 165, 205), (105, 70, 45)),
+}
+
+
+def check_floor_colors():
+    """The floor colour must be LEARNED, not assumed.
+
+    Every other test here uses one floor colour, so they'd all still pass
+    with a hardcoded range -- they can't tell the difference. These vary the
+    floor and paint colours instead. A hardcoded tan range fails all but the
+    first; a learned one shouldn't care, since it only needs paint to differ
+    from floor, not to be any particular colour.
+    """
+    court_to_img = build(CAMERAS["sideline A"])
+    _, to_img = render(court_to_img)
+    all_ok = True
+
+    for name, (floor_bgr, paint_bgr) in FLOOR_SCHEMES.items():
+        frame = np.full((IMG_H, IMG_W, 3), CROWD_BGR, dtype=np.uint8)
+        for poly, color in [
+            ([(-4, -4), (54, -4), (54, 51), (-4, 51)], floor_bgr),
+            (c.KEY_CORNERS_FT, paint_bgr),
+        ]:
+            cv2.fillPoly(frame, [np.array([to_img(p) for p in poly], dtype=np.int32)], color)
+
+        hoop_floor = to_img((25, 5.25))
+        hoop_px = (float(hoop_floor[0]), float(hoop_floor[1]) - 120.0)
+        scored = c.detect_key_with_score(frame, hoop_px)
+        floor_mask = c.court_quad_debug(frame).get("morphed_color_mask")
+        H = (c.key_anchored_homography(scored[0], floor_mask)
+             if scored is not None and floor_mask is not None else None)
+        if H is None:
+            print(f"    {name}: FAIL -- no calibration")
+            all_ok = False
+            continue
+
+        direct = mirrored = 0.0
+        for pt in CHECKS:
+            back = c.project_point(H, tuple(map(float, to_img(pt))))
+            direct = max(direct, math.hypot(back[0] - pt[0], back[1] - pt[1]))
+            mirrored = max(mirrored, math.hypot(back[0] - (50 - pt[0]), back[1] - pt[1]))
+        error = min(direct, mirrored)
+        ok = error < TOLERANCE_FT
+        all_ok = all_ok and ok
+        print(f"    {name}: {error:.2f} ft -- {'PASS' if ok else 'FAIL'}")
+
+    print(f"  adaptive floor colour -- {'PASS' if all_ok else 'FAIL'}")
+    return all_ok
+
+
 def main():
     print(f"Court calibration vs ground truth (tolerance {TOLERANCE_FT} ft):")
     results = [check_camera(name, pts) for name, pts in CAMERAS.items()]
     results.append(check_occlusion())
     results.append(check_false_hoop())
     results.append(check_crowd_bridge())
+    results.append(check_floor_colors())
     failures = results.count(False)
     print(f"\n{len(results) - failures}/{len(results)} checks pass")
     return 1 if failures else 0
